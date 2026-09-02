@@ -108,9 +108,13 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     @objc private func toggleAutoPaste() {
         autoPasteEnabled.toggle()
         if autoPasteEnabled {
-            _ = AXIsProcessTrustedWithOptions(
-                ["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            requestAccessibilityTrust()
         }
+    }
+
+    private func requestAccessibilityTrust() {
+        guard !AXIsProcessTrusted() else { return }
+        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
     }
 
     @objc private func logInToDiscord() {
@@ -187,10 +191,12 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     func gifPicker(_ picker: GIFPickerViewController, didChoose favorite: GIFFavorite) {
         dismissPickerIfNeeded()
         popover.performClose(nil)
-        guard autoPasteEnabled else {
+        let pasteRequested = autoPasteEnabled || NSEvent.modifierFlags.contains(.shift)
+        guard pasteRequested else {
             GIFSelectionWriter.copySourceURL(of: favorite)
             return
         }
+        requestAccessibilityTrust()
         previousApp?.activate()
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(150))
