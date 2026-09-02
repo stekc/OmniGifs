@@ -24,4 +24,42 @@ struct GIFSelectionWriterTests {
         #expect(GIFSelectionWriter.copySourceURL(of: favorite, to: pasteboard))
         #expect(pasteboard.string(forType: .string) == sourceURL.absoluteString)
     }
+
+    @Test func restoresClipboardOnlyWhenTemporaryURLIsStillCurrent() throws {
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("OmniGifsTests.\(UUID().uuidString)")
+        )
+        pasteboard.clearContents()
+        pasteboard.setString("Lorem ipsum", forType: .string)
+
+        let transaction = try #require(
+            GIFSelectionWriter.prepareTemporaryURL(
+                "https://example.com/temporary",
+                on: pasteboard
+            )
+        )
+        #expect(pasteboard.string(forType: .string) == "https://example.com/temporary")
+        #expect(GIFSelectionWriter.restorePasteboardIfUnchanged(transaction, on: pasteboard))
+        #expect(pasteboard.string(forType: .string) == "Lorem ipsum")
+    }
+
+    @Test func doesNotOverwriteAClipboardChangeMadeAfterTemporaryURL() throws {
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("OmniGifsTests.\(UUID().uuidString)")
+        )
+        pasteboard.clearContents()
+        pasteboard.setString("Lorem ipsum", forType: .string)
+
+        let transaction = try #require(
+            GIFSelectionWriter.prepareTemporaryURL(
+                "https://example.com/temporary",
+                on: pasteboard
+            )
+        )
+        pasteboard.clearContents()
+        pasteboard.setString("Dolor sit amet", forType: .string)
+
+        #expect(!GIFSelectionWriter.restorePasteboardIfUnchanged(transaction, on: pasteboard))
+        #expect(pasteboard.string(forType: .string) == "Dolor sit amet")
+    }
 }

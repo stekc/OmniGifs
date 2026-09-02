@@ -1,6 +1,6 @@
 # OmniGifs
 
-![OmniGifs](docs/assets/screenshot.png)
+![OmniGifs](docs/assets/screenshot.jpg)
 
 ## About
 

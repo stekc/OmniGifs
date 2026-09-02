@@ -176,7 +176,7 @@ final class GIFPickerViewController: NSViewController {
         glass.style = .regular
         glass.contentView = headerContent
 
-        emptyLoginButton.title = "Log In to Discord"
+        emptyLoginButton.title = "Log In"
         emptyLoginButton.target = self
         emptyLoginButton.action = #selector(emptyLoginButtonPressed)
         emptyLoginButton.bezelStyle = .rounded
