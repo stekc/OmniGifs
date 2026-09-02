@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import OSLog
 
 @MainActor
@@ -9,15 +10,28 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     private var picker: GIFPickerViewController
     private let discordSession: DiscordSessionCoordinator
     private var pickerIsPresented = false
+    private var previousApp: NSRunningApplication?
+    private static let autoPasteKey = "autoPasteEnabled"
     private lazy var discordMenuItem = NSMenuItem(
         title: "Log In to Discord",
         action: #selector(logInToDiscord),
         keyEquivalent: ""
     )
+    private lazy var autoPasteMenuItem: NSMenuItem = {
+        let item = NSMenuItem(
+            title: "Paste without copying",
+            action: #selector(toggleAutoPaste),
+            keyEquivalent: ""
+        )
+        item.target = self
+        return item
+    }()
     private lazy var contextMenu: NSMenu = {
         let menu = NSMenu()
         discordMenuItem.target = self
         menu.addItem(discordMenuItem)
+        menu.addItem(.separator())
+        menu.addItem(autoPasteMenuItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit OmniGifs",
@@ -68,6 +82,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
             let button = statusItem.button
         {
             updateDiscordMenuItem()
+            autoPasteMenuItem.state = autoPasteEnabled ? .on : .off
             NSMenu.popUpContextMenu(contextMenu, with: event, for: button)
             return
         }
@@ -83,6 +98,19 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
 
     @objc private func quitApplication() {
         NSApp.terminate(nil)
+    }
+
+    private var autoPasteEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.autoPasteKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.autoPasteKey) }
+    }
+
+    @objc private func toggleAutoPaste() {
+        autoPasteEnabled.toggle()
+        if autoPasteEnabled {
+            _ = AXIsProcessTrustedWithOptions(
+                ["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        }
     }
 
     @objc private func logInToDiscord() {
@@ -118,6 +146,10 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
 
     private func presentPopover() {
         guard let button = statusItem.button, !popover.isShown else { return }
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            previousApp = front
+        }
         if popover.contentViewController == nil {
             popover.contentViewController = picker
             popover.contentSize = picker.preferredContentSize
@@ -153,8 +185,16 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     }
 
     func gifPicker(_ picker: GIFPickerViewController, didChoose favorite: GIFFavorite) {
-        GIFSelectionWriter.copySourceURL(of: favorite)
         dismissPickerIfNeeded()
         popover.performClose(nil)
+        guard autoPasteEnabled else {
+            GIFSelectionWriter.copySourceURL(of: favorite)
+            return
+        }
+        previousApp?.activate()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            GIFSelectionWriter.pasteSourceURL(of: favorite)
+        }
     }
 }
