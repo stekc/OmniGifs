@@ -88,24 +88,28 @@ final class AnimatedWebPPlayer {
         self.layer = layer
     }
 
+    deinit {
+        playbackTask?.cancel()
+    }
+
     func play() {
         guard playbackTask == nil else { return }
         playbackGeneration &+= 1
         let generation = playbackGeneration
         playbackTask = Task { [weak self, decoder] in
-            guard let self else { return }
             while !Task.isCancelled {
+                guard self?.playbackGeneration == generation else { break }
                 guard let frame = await decoder.nextFrame(), !Task.isCancelled else { break }
-                layer?.contents = frame.image
+                guard let self, self.playbackGeneration == generation else { break }
+                self.layer?.contents = frame.image
                 do {
                     try await Task.sleep(for: .seconds(frame.delay))
                 } catch {
                     break
                 }
             }
-            if playbackGeneration == generation {
-                playbackTask = nil
-            }
+            guard let self, self.playbackGeneration == generation else { return }
+            self.playbackTask = nil
         }
     }
 

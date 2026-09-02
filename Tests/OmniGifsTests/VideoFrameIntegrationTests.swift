@@ -101,4 +101,29 @@ struct VideoFrameIntegrationTests {
         let renderedFrameAfterRestart = await waitForContents(on: layer)
         #expect(renderedFrameAfterRestart)
     }
+
+    @MainActor
+    @Test func playingWebPPlayerDoesNotRetainItself() async {
+        let layer = CALayer()
+        layer.frame = CGRect(x: 0, y: 0, width: 64, height: 64)
+        var player = AnimatedWebPPlayer(
+            cacheKey: "fixture",
+            data: Self.twoFrameWebP,
+            layer: layer,
+            maximumPixelSize: 64
+        )
+        #expect(player != nil)
+        weak let weakPlayer = player
+
+        player?.play()
+        #expect(await waitForContents(on: layer))
+        player = nil
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while weakPlayer != nil, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(weakPlayer == nil)
+    }
 }
