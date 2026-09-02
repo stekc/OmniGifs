@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check publication hygiene
+        run: ./scripts/check-publication.sh
+
+      - name: Test
+        run: xcrun swift test
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare OpenAI CLIP
+        run: |
+          python -m pip install --requirement scripts/model-requirements.txt
+          python scripts/prepare-openai-clip-models.py .build/openai-clip-models
+
+      - name: Verify OpenAI CLIP runtime contract
+        env:
+          OMNIGIFS_MODEL_TEST_DIR: ${{ github.workspace }}/.build/openai-clip-models
+        run: xcrun swift test --filter CLIPIntegrationTests
+
+      - name: Build release app
+        run: ./scripts/build-app.sh
+
+      - name: Verify app
+        run: |
+          test "$(defaults read "$PWD/outputs/OmniGifs.app/Contents/Info" CFBundleIdentifier)" = "win.stkc.omnigifs"
+          codesign --verify --deep --strict --verbose=2 outputs/OmniGifs.app
+          python scripts/smoke-test-app.py outputs/OmniGifs.app
+
+      - name: Package app
+        run: |
+          archive="OmniGifs-${GITHUB_REF_NAME}.zip"
+          ditto -c -k --sequesterRsrc --keepParent outputs/OmniGifs.app "$archive"
+          shasum -a 256 "$archive" > "${archive}.sha256"
+
+      - name: Upload build artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniGifs-${{ github.sha }}
+          path: |
+            OmniGifs-${{ github.ref_name }}.zip
+            OmniGifs-${{ github.ref_name }}.zip.sha256
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="OmniGifs-${GITHUB_REF_NAME}.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$archive" "${archive}.sha256" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$archive" \
+              "${archive}.sha256" \
+              --title "OmniGifs ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

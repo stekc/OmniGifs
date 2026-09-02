@@ -1,0 +1,13 @@
+.DS_Store
+.vscode/
+.build/
+outputs/
+work/
+DerivedData/
+*.trace
+*.xcresult
+*.profdata
+*.xccovarchive
+*.xccovreport
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+xcuserdata/

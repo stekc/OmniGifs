@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check publication hygiene
+        run: ./scripts/check-publication.sh
+      - name: Lint
+        run: xcrun swift-format lint --strict --recursive Sources Tests scripts Package.swift
+      - name: Build with warnings as errors
+        run: xcrun swift build -Xswiftc -warnings-as-errors
+      - name: Test
+        run: xcrun swift test
