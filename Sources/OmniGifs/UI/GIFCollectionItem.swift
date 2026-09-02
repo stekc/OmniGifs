@@ -107,8 +107,8 @@ final class GIFCollectionItem: NSCollectionViewItem {
         animatedImageLayer?.frame = view.bounds
     }
 
-    override var isSelected: Bool {
-        didSet { selectionOverlay.isHidden = !isSelected }
+    override var highlightState: NSCollectionViewItem.HighlightState {
+        didSet { selectionOverlay.isHidden = highlightState != .forSelection }
     }
 
     var favoriteID: String? { representedID }
