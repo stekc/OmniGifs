@@ -41,6 +41,10 @@ actor CLIPEmbeddingService {
     private let textModelURL: URL
     private var inProcessTextModel: MLModel?
     private var inProcessTokenizer: CLIPTokenizer?
+    private var inProcessTextInputArray: MLMultiArray?
+    private var inProcessTextInput: MLDictionaryFeatureProvider?
+    private var inProcessTextOutputArray: MLMultiArray?
+    private var inProcessTextOptions: MLPredictionOptions?
     private var textWorker: TextEmbeddingWorker?
     private let imageContext = CIContext(options: [.cacheIntermediates: false])
 
@@ -96,12 +100,15 @@ actor CLIPEmbeddingService {
     }
 
     func embed(text: String) throws -> [Float] {
+        try Task.checkCancellation()
         if textWorker == nil {
             textWorker = try TextEmbeddingWorker()
         }
+        try Task.checkCancellation()
         guard let vector = try textWorker?.embed(text: text) else {
             throw ModelError.missingFeature("text worker output")
         }
+        try Task.checkCancellation()
         return vector
     }
 
@@ -127,11 +134,35 @@ actor CLIPEmbeddingService {
             inProcessTokenizer = loaded
             tokenizer = loaded
         }
+        let inputArray: MLMultiArray
+        let input: MLDictionaryFeatureProvider
+        let options: MLPredictionOptions
+        if let cachedArray = inProcessTextInputArray,
+            let cachedInput = inProcessTextInput,
+            let cachedOptions = inProcessTextOptions
+        {
+            inputArray = cachedArray
+            input = cachedInput
+            options = cachedOptions
+        } else {
+            let array = try MLMultiArray(shape: [1, 77], dataType: .int32)
+            let provider = try MLDictionaryFeatureProvider(dictionary: ["text": array])
+            let output = try MLMultiArray(shape: [1, 512], dataType: .float32)
+            let predictionOptions = MLPredictionOptions()
+            predictionOptions.outputBackings = ["embedding": output]
+            inProcessTextInputArray = array
+            inProcessTextInput = provider
+            inProcessTextOutputArray = output
+            inProcessTextOptions = predictionOptions
+            inputArray = array
+            input = provider
+            options = predictionOptions
+        }
         let ids = try tokenizer.encode(text)
-        let array = try MLMultiArray(shape: [1, 77], dataType: .int32)
-        for (index, token) in ids.enumerated() { array[index] = NSNumber(value: token) }
-        let input = try MLDictionaryFeatureProvider(dictionary: ["text": array])
-        let result = try textModel.prediction(from: input)
+        for (index, token) in ids.enumerated() {
+            inputArray[index] = NSNumber(value: token)
+        }
+        let result = try textModel.prediction(from: input, options: options)
         guard let output = result.featureValue(for: "embedding")?.multiArrayValue else {
             throw ModelError.missingFeature("embedding")
         }
@@ -148,6 +179,10 @@ actor CLIPEmbeddingService {
         imageModel = nil
         inProcessTextModel = nil
         inProcessTokenizer = nil
+        inProcessTextInputArray = nil
+        inProcessTextInput = nil
+        inProcessTextOutputArray = nil
+        inProcessTextOptions = nil
     }
 
     private func makePixelBuffer(from image: CGImage) -> CVPixelBuffer? {
@@ -187,7 +222,16 @@ actor CLIPEmbeddingService {
     }
 
     private func normalizedFloats(_ array: MLMultiArray) -> [Float] {
-        var values = (0..<array.count).map { array[$0].floatValue }
+        var values: [Float]
+        if array.dataType == .float32 {
+            values = Array(
+                UnsafeBufferPointer(
+                    start: array.dataPointer.assumingMemoryBound(to: Float.self),
+                    count: array.count
+                ))
+        } else {
+            values = (0..<array.count).map { array[$0].floatValue }
+        }
         var squared: Float = 0
         vDSP_svesq(values, 1, &squared, vDSP_Length(values.count))
         var magnitude = sqrt(max(squared, .leastNonzeroMagnitude))

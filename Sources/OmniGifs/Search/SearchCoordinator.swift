@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import OSLog
@@ -14,9 +15,34 @@ actor SearchCoordinator {
     static let shared = SearchCoordinator()
     private static let logger = Logger(subsystem: "win.stkc.omnigifs", category: "SearchIndex")
 
+    private enum EmbeddingOutcome: Sendable {
+        case success([Float])
+        case cancelled
+        case failure(String)
+    }
+
+    private enum PendingEmbedding {
+        case cached([Float])
+        case task(Task<EmbeddingOutcome, Never>)
+        case unavailable
+
+        func cancel() {
+            if case .task(let task) = self { task.cancel() }
+        }
+    }
+
     private let index: SQLiteSearchIndex?
     private var indexingIDs: Set<String> = []
     private var embeddingService: CLIPEmbeddingService?
+    private var vectorSearchSnapshot: SQLiteSearchIndex.VectorSearchSnapshot?
+    private var cachedFavorites: [GIFFavorite] = []
+    private var urlSearchSnapshot = URLSearchSnapshot(favorites: [])
+    private var resultCache: [String: [GIFSearchResult]] = [:]
+    private var resultCacheOrder: [String] = []
+    private var queryVectorCache: [String: [Float]] = [:]
+    private var queryVectorCacheOrder: [String] = []
+    private var pendingQueryVectorWrites: [String: [Float]] = [:]
+    private var queryCachePersistenceTask: Task<Void, Never>?
     private var isIndexing = false
     private var latestProgress: SearchIndexProgress?
     private var progressContinuations: [UUID: AsyncStream<SearchIndexProgress>.Continuation] = [:]
@@ -28,6 +54,38 @@ actor SearchCoordinator {
             index = nil
             Self.logger.error(
                 "Unable to open search index: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Builds the compact vector view off the main thread during app startup,
+    /// so the first popover and first query never pay SQLite decoding cost.
+    func prepareForLaunch() {
+        guard vectorSearchSnapshot == nil, !isIndexing else { return }
+        vectorSearchSnapshot = index?.makeVectorSearchSnapshot()
+        // Building the contiguous matrix briefly decodes thousands of SQLite
+        // BLOBs. Keep the finished snapshot, but immediately return the much
+        // larger temporary allocator regions instead of carrying them idle.
+        malloc_zone_pressure_relief(nil, 0)
+    }
+
+    /// Starts the two expensive cold resources as soon as the popover opens,
+    /// before a person can focus the field and type a searchable second
+    /// character. Both are released again when the popover closes.
+    func prepareForPresentation(_ favorites: [GIFFavorite]) async {
+        prepareSearchCorpus(favorites)
+        if vectorSearchSnapshot == nil, !isIndexing {
+            vectorSearchSnapshot = index?.makeVectorSearchSnapshot()
+        }
+        guard !Task.isCancelled else { return }
+        let embeddings = loadEmbeddingServiceIfNeeded()
+        do {
+            _ = try await embeddings?.embed(text: "gif")
+        } catch is CancellationError {
+            return
+        } catch {
+            Self.logger.error(
+                "Text embedding warmup failed: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 
@@ -76,7 +134,10 @@ actor SearchCoordinator {
         guard !isIndexing else { return false }
         var storageErrorOccurred = false
         do {
-            try index.prune(keeping: Set(favorites.map(\.id)))
+            if try index.prune(keeping: Set(favorites.map(\.id))) {
+                vectorSearchSnapshot = nil
+                clearResultCache()
+            }
         } catch {
             storageErrorOccurred = true
             Self.logger.error(
@@ -98,6 +159,8 @@ actor SearchCoordinator {
         }
 
         isIndexing = true
+        vectorSearchSnapshot = nil
+        clearResultCache()
         defer { isIndexing = false }
         let embeddings = loadEmbeddingServiceIfNeeded()
 
@@ -197,35 +260,41 @@ actor SearchCoordinator {
                     unavailable: index.unavailableCount()
                 ), to: progress)
         }
+        vectorSearchSnapshot = nil
+        clearResultCache()
         return true
     }
 
     func search(_ query: String, among favorites: [GIFFavorite]) async -> [GIFSearchResult] {
-        guard SearchQueryPolicy.isSearchable(query) else { return [] }
+        guard SearchQueryPolicy.isSearchable(query), !Task.isCancelled else { return [] }
+        prepareSearchCorpus(favorites)
+        if let cached = resultCache[query] {
+            touchCachedResult(query)
+            return cached
+        }
         if SearchQueryPolicy.requiresStrictConjunction(query) {
-            return await searchStrictConjunction(
+            let results = await searchStrictConjunction(
                 SearchQueryPolicy.commaSeparatedClauses(query),
                 among: favorites
             )
+            if !Task.isCancelled { cacheResults(results, for: query) }
+            return results
         }
+        let pendingQueryVector = beginEmbeddingVector(for: query)
+        defer { pendingQueryVector.cancel() }
         let fts = index?.search(query) ?? []
-        let direct = favorites.filter {
-            URLSearchMatcher.matches(query, sourceURL: $0.sourceURL)
-        }.map(\.id)
-        let looksNatural = await SemanticQueryGate.looksNatural(query)
+        let direct = urlSearchSnapshot.matchingIDs(query)
+        let looksNatural =
+            fts.isEmpty && direct.isEmpty
+            ? await SemanticQueryGate.looksNatural(query)
+            : false
+        guard !Task.isCancelled else { return [] }
         let hasLexicalEvidence = !fts.isEmpty || !direct.isEmpty || looksNatural
-        let embeddings = loadEmbeddingServiceIfNeeded()
-        let queryVector: [Float]?
-        do {
-            queryVector = try await embeddings?.embed(text: query)
-        } catch {
-            queryVector = nil
-            Self.logger.error(
-                "Text embedding failed: \(error.localizedDescription, privacy: .public)")
-        }
+        let queryVector = await finishEmbeddingVector(pendingQueryVector, for: query)
+        guard !Task.isCancelled else { return [] }
         let scoredSemantic =
             queryVector.flatMap {
-                index?.searchScored(vector: $0, limit: 150)
+                semanticMatches(for: $0)
             } ?? []
         let semantic = SemanticResultFilter.ids(
             from: scoredSemantic,
@@ -235,6 +304,7 @@ actor SearchCoordinator {
             uniqueKeysWithValues: scoredSemantic.map { ($0.id, $0.score) })
         let directSet = Set(direct)
         let ocrSet = Set(fts)
+        let semanticSet = Set(semantic)
 
         var scores: [String: Double] = [:]
         for (rank, id) in direct.enumerated() {
@@ -249,10 +319,10 @@ actor SearchCoordinator {
         let rankedIDs = scores.sorted { lhs, rhs in
             lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value
         }.map(\.key)
-        return rankedIDs.map { id in
+        let results = rankedIDs.map { id in
             let aiSimilarityPercentage: Int?
             if let score = semanticScores[id],
-                semantic.contains(id)
+                semanticSet.contains(id)
             {
                 aiSimilarityPercentage = SemanticResultFilter.similarityPercentage(for: score)
             } else {
@@ -265,24 +335,16 @@ actor SearchCoordinator {
                 aiSimilarityPercentage: aiSimilarityPercentage
             )
         }
+        cacheResults(results, for: query)
+        return results
     }
 
     private func searchStrictConjunction(
         _ clauses: [String],
         among favorites: [GIFFavorite]
     ) async -> [GIFSearchResult] {
-        let embeddings = loadEmbeddingServiceIfNeeded()
+        guard !Task.isCancelled else { return [] }
         let favoriteIDs = Set(favorites.map(\.id))
-        let sourceURLs = Dictionary(
-            uniqueKeysWithValues: favorites.map {
-                (
-                    $0.id,
-                    URLSearchMatcher.canonicalText(
-                        $0.sourceURL.absoluteString.removingPercentEncoding
-                            ?? $0.sourceURL.absoluteString
-                    )
-                )
-            })
 
         var clauseMatches: [Set<String>] = []
         var clauseOCR: [Set<String>] = []
@@ -291,25 +353,21 @@ actor SearchCoordinator {
         var clauseSemanticScores: [[String: Float]] = []
 
         for clause in clauses {
+            guard !Task.isCancelled else { return [] }
+            let pendingVector = beginEmbeddingVector(for: clause)
+            defer { pendingVector.cancel() }
             let ocr = Set(index?.search(clause) ?? []).intersection(favoriteIDs)
-            let folded = URLSearchMatcher.canonicalText(clause)
-            let url = Set(
-                sourceURLs.compactMap { id, sourceURL in
-                    sourceURL.contains(folded) ? id : nil
-                })
-            let looksNatural = await SemanticQueryGate.looksNatural(clause)
-            let vector: [Float]?
-            do {
-                vector = try await embeddings?.embed(text: clause)
-            } catch {
-                vector = nil
-                Self.logger.error(
-                    "Text embedding failed: \(error.localizedDescription, privacy: .public)"
-                )
-            }
+            let url = Set(urlSearchSnapshot.matchingIDs(clause))
+            let looksNatural =
+                ocr.isEmpty && url.isEmpty
+                ? await SemanticQueryGate.looksNatural(clause)
+                : false
+            guard !Task.isCancelled else { return [] }
+            let vector = await finishEmbeddingVector(pendingVector, for: clause)
+            guard !Task.isCancelled else { return [] }
             let scored =
                 vector.flatMap {
-                    index?.searchScored(vector: $0, limit: 150)
+                    semanticMatches(for: $0)
                 } ?? []
             let semanticIDs = SemanticResultFilter.ids(
                 from: scored,
@@ -394,12 +452,17 @@ actor SearchCoordinator {
         index?.unavailableIDs() ?? []
     }
 
-    /// The search index owns the durable vectors/OCR. Core ML encoders are
-    /// transient and should not keep hundreds of MB resident while hidden.
+    /// Core ML encoders are transient and should not keep hundreds of MB
+    /// resident while hidden. The compact read-only vector snapshot remains
+    /// alive for instant reopen searches and is invalidated whenever the index
+    /// or favorite corpus changes.
     func releaseRuntimeResources() async {
         // The image encoder is released by the indexing job when it finishes.
         // Closing a popover must not tear the shared job down mid-inference.
         guard !isIndexing else { return }
+        queryCachePersistenceTask?.cancel()
+        queryCachePersistenceTask = nil
+        persistPendingQueryVectors()
         let service = embeddingService
         embeddingService = nil
         await service?.shutdown()
@@ -409,7 +472,174 @@ actor SearchCoordinator {
         await releaseRuntimeResources()
         try index?.clear()
         indexingIDs.removeAll(keepingCapacity: false)
+        cachedFavorites.removeAll(keepingCapacity: false)
+        urlSearchSnapshot = URLSearchSnapshot(favorites: [])
+        clearResultCache()
+        queryVectorCache.removeAll(keepingCapacity: false)
+        queryVectorCacheOrder.removeAll(keepingCapacity: false)
+        pendingQueryVectorWrites.removeAll(keepingCapacity: false)
+        queryCachePersistenceTask?.cancel()
+        queryCachePersistenceTask = nil
+        vectorSearchSnapshot = nil
         latestProgress = nil
+    }
+
+    private func prepareSearchCorpus(_ favorites: [GIFFavorite]) {
+        guard favorites != cachedFavorites else { return }
+        cachedFavorites = favorites
+        urlSearchSnapshot = URLSearchSnapshot(favorites: favorites)
+        clearResultCache()
+    }
+
+    private func semanticMatches(for vector: [Float]) -> [SQLiteSearchIndex.VectorMatch] {
+        if vectorSearchSnapshot == nil, !isIndexing {
+            vectorSearchSnapshot = index?.makeVectorSearchSnapshot()
+        }
+        if let vectorSearchSnapshot, vectorSearchSnapshot.dimension == vector.count {
+            return vectorSearchSnapshot.searchScored(vector: vector, limit: 150)
+        }
+        return index?.searchScored(vector: vector, limit: 150) ?? []
+    }
+
+    private func beginEmbeddingVector(for query: String) -> PendingEmbedding {
+        let cacheKey = Self.embeddingCacheKey(for: query)
+        if let cached = queryVectorCache[cacheKey] {
+            touchCachedVector(cacheKey)
+            return .cached(cached)
+        }
+        let queryDigest = Self.queryDigest(for: cacheKey)
+        if CLIPEmbeddingService.isInstalled,
+            let cached = index?.cachedQueryEmbedding(
+                queryDigest: queryDigest,
+                modelVersion: CLIPEmbeddingService.modelVersion
+            )
+        {
+            cacheVectorInMemory(cached, for: cacheKey)
+            scheduleVectorPersistence(cached, queryDigest: queryDigest)
+            return .cached(cached)
+        }
+        guard !Task.isCancelled, let embeddings = loadEmbeddingServiceIfNeeded() else {
+            return .unavailable
+        }
+        return .task(
+            Task.detached(priority: .userInitiated) {
+                do {
+                    return .success(try await embeddings.embed(text: query))
+                } catch is CancellationError {
+                    return .cancelled
+                } catch {
+                    return .failure(error.localizedDescription)
+                }
+            })
+    }
+
+    private func finishEmbeddingVector(
+        _ pending: PendingEmbedding,
+        for query: String
+    ) async -> [Float]? {
+        switch pending {
+        case .cached(let vector):
+            return vector
+        case .unavailable:
+            return nil
+        case .task(let task):
+            let outcome = await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard !Task.isCancelled else { return nil }
+            switch outcome {
+            case .success(let vector):
+                let cacheKey = Self.embeddingCacheKey(for: query)
+                cacheVectorInMemory(vector, for: cacheKey)
+                scheduleVectorPersistence(
+                    vector,
+                    queryDigest: Self.queryDigest(for: cacheKey)
+                )
+                return vector
+            case .cancelled:
+                return nil
+            case .failure(let description):
+                Self.logger.error(
+                    "Text embedding failed: \(description, privacy: .public)"
+                )
+                return nil
+            }
+        }
+    }
+
+    private func cacheResults(_ results: [GIFSearchResult], for query: String) {
+        guard !Task.isCancelled else { return }
+        resultCache[query] = results
+        touchCachedResult(query)
+        if resultCacheOrder.count > 64 {
+            let evicted = resultCacheOrder.removeFirst()
+            resultCache.removeValue(forKey: evicted)
+        }
+    }
+
+    private func touchCachedResult(_ query: String) {
+        resultCacheOrder.removeAll { $0 == query }
+        resultCacheOrder.append(query)
+    }
+
+    private func touchCachedVector(_ query: String) {
+        queryVectorCacheOrder.removeAll { $0 == query }
+        queryVectorCacheOrder.append(query)
+    }
+
+    private func cacheVectorInMemory(_ vector: [Float], for cacheKey: String) {
+        queryVectorCache[cacheKey] = vector
+        touchCachedVector(cacheKey)
+        if queryVectorCacheOrder.count > 64 {
+            let evicted = queryVectorCacheOrder.removeFirst()
+            queryVectorCache.removeValue(forKey: evicted)
+        }
+    }
+
+    private func scheduleVectorPersistence(_ vector: [Float], queryDigest: String) {
+        pendingQueryVectorWrites[queryDigest] = vector
+        queryCachePersistenceTask?.cancel()
+        queryCachePersistenceTask = Task(priority: .utility) { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await self?.flushScheduledQueryVectors()
+        }
+    }
+
+    private func flushScheduledQueryVectors() {
+        queryCachePersistenceTask = nil
+        persistPendingQueryVectors()
+    }
+
+    private func persistPendingQueryVectors() {
+        guard !pendingQueryVectorWrites.isEmpty else { return }
+        let pending = pendingQueryVectorWrites
+        pendingQueryVectorWrites.removeAll(keepingCapacity: true)
+        do {
+            try index?.storeQueryEmbeddings(
+                pending.map { (queryDigest: $0.key, vector: $0.value) },
+                modelVersion: CLIPEmbeddingService.modelVersion
+            )
+        } catch {
+            Self.logger.error(
+                "Unable to persist query acceleration: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private static func embeddingCacheKey(for query: String) -> String {
+        query.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    private static func queryDigest(for cacheKey: String) -> String {
+        Data(SHA256.hash(data: Data(cacheKey.utf8))).base64EncodedString()
+    }
+
+    private func clearResultCache() {
+        resultCache.removeAll(keepingCapacity: false)
+        resultCacheOrder.removeAll(keepingCapacity: false)
     }
 
     private func loadEmbeddingServiceIfNeeded() -> CLIPEmbeddingService? {

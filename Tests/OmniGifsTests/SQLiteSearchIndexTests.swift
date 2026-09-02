@@ -47,6 +47,108 @@ struct SQLiteSearchIndexTests {
         #expect(index.needsIndex("near", modelVersion: "new-version"))
     }
 
+    @Test func memoryVectorSnapshotExactlyMatchesDurableSearch() throws {
+        let index = try makeIndex()
+        try index.upsert(
+            id: "first",
+            sourceURL: "https://cdn.example/first.gif",
+            ocrText: "",
+            modelVersion: "test",
+            embeddings: [[0.25, 0.75], [0.5, 0.5]]
+        )
+        try index.upsert(
+            id: "second",
+            sourceURL: "https://cdn.example/second.gif",
+            ocrText: "",
+            modelVersion: "test",
+            embeddings: [[0.75, 0.25], [0.5, 0.5]]
+        )
+        let snapshot = try #require(index.makeVectorSearchSnapshot())
+
+        for query: [Float] in [[1, 0], [0, 1], [0.5, 0.5]] {
+            #expect(
+                snapshot.searchScored(vector: query)
+                    == index.searchScored(vector: query)
+            )
+        }
+    }
+
+    @Test func acceleratedVectorSearchMatchesDurableSearchAcrossLargeCorpus() throws {
+        let index = try makeIndex()
+        let dimension = 32
+        for item in 0..<340 {
+            let vectors = (0..<2).map { frame in
+                (0..<dimension).map { component in
+                    Float(sin(Double((item + 1) * (component + 3) + frame)))
+                }
+            }
+            try index.upsert(
+                id: "item-\(item)",
+                sourceURL: "https://cdn.example/item-\(item).gif",
+                ocrText: "",
+                modelVersion: "test",
+                embeddings: vectors
+            )
+        }
+        let snapshot = try #require(index.makeVectorSearchSnapshot())
+
+        for queryIndex in 0..<12 {
+            let query = (0..<dimension).map { component in
+                Float(cos(Double((queryIndex + 2) * (component + 1))))
+            }
+            #expect(
+                snapshot.searchScored(vector: query)
+                    == index.searchScored(vector: query)
+            )
+        }
+    }
+
+    @Test func queryEmbeddingCachePersistsExactVectorsByModelVersion() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OmniGifsTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("Search.sqlite3")
+        let vector: [Float] = [0.125, -0.25, 0.5, 0.75]
+
+        do {
+            let index = try SQLiteSearchIndex(databaseURL: url)
+            try index.storeQueryEmbeddings(
+                [
+                    (queryDigest: "opaque-digest", vector: vector),
+                    (queryDigest: "second-digest", vector: Array(vector.reversed())),
+                ],
+                modelVersion: "model-a"
+            )
+        }
+
+        let reopened = try SQLiteSearchIndex(databaseURL: url)
+        #expect(
+            reopened.cachedQueryEmbedding(
+                queryDigest: "opaque-digest",
+                modelVersion: "model-a"
+            ) == vector
+        )
+        #expect(
+            reopened.cachedQueryEmbedding(
+                queryDigest: "opaque-digest",
+                modelVersion: "model-b"
+            ) == nil
+        )
+        #expect(
+            reopened.cachedQueryEmbedding(
+                queryDigest: "second-digest",
+                modelVersion: "model-a"
+            ) == Array(vector.reversed())
+        )
+        try reopened.clear()
+        #expect(
+            reopened.cachedQueryEmbedding(
+                queryDigest: "opaque-digest",
+                modelVersion: "model-a"
+            ) == nil
+        )
+    }
+
     @Test func commaSeparatedOCRTermsAreStrictAND() throws {
         let index = try makeIndex()
         try index.upsert(

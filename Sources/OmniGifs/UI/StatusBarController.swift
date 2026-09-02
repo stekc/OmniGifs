@@ -70,6 +70,9 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         configurePopover()
         configureMainMenu()
         picker.startInitialRefresh()
+        Task(priority: .utility) {
+            await SearchCoordinator.shared.prepareForLaunch()
+        }
 
         if let button = statusItem.button {
             if let iconURL = AppResources.bundle.url(

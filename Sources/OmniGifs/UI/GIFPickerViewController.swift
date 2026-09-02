@@ -36,6 +36,7 @@ final class GIFPickerViewController: NSViewController {
     private var displayedOrder: [GIFFavorite] = []
     private var displayedSearchResults: [String: GIFSearchResult] = [:]
     private var searchTask: Task<Void, Never>?
+    private var searchWarmupTask: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
     private var indexProgressTask: Task<Void, Never>?
     private var playbackResumeTask: Task<Void, Never>?
@@ -43,8 +44,10 @@ final class GIFPickerViewController: NSViewController {
     private var indexProgress: SearchIndexProgress?
     private var playbackEnabled = false
     private var isPresented = false
+    private var isPreparingPresentation = false
     private var lastCompletedSearchQuery: String?
     private var scrollToTopAfterReload = false
+    private var lastObservedScrollOrigin = NSPoint.zero
     private var refreshGeneration = 0
 
     init(library: GIFLibrary, session: DiscordSessionCoordinator, search: SearchCoordinator) {
@@ -61,6 +64,7 @@ final class GIFPickerViewController: NSViewController {
         indexProgressTask?.cancel()
         presentationTask?.cancel()
         searchTask?.cancel()
+        searchWarmupTask?.cancel()
         playbackResumeTask?.cancel()
         scrollPlaybackRecoveryTask?.cancel()
     }
@@ -205,12 +209,20 @@ final class GIFPickerViewController: NSViewController {
                     for: indexPath
                 ) as? GIFCollectionItem
             else { return nil }
-            // A reused cell may still carry the previous presentation's state.
-            // Disable it before configure(), since configure can start playback.
-            item.setPlaybackEnabled(false)
-            liveItems.add(item)
+            self.liveItems.add(item)
+            guard self.isPresented || self.isPreparingPresentation else {
+                item.setPlaybackEnabled(false)
+                return item
+            }
+            // Reconfiguration of an unchanged item must not toggle animation:
+            // NSImageView restarts an animated GIF at frame zero when `animates`
+            // is turned off and back on during a diffable snapshot update.
+            let isSameFavorite = item.favoriteID == favorite.id
+            if !isSameFavorite { item.setPlaybackEnabled(false) }
             item.configure(with: favorite, searchResult: displayedSearchResults[id])
-            item.setPlaybackEnabled(isPresented && playbackEnabled)
+            if !isSameFavorite {
+                item.setPlaybackEnabled(isPresented && playbackEnabled)
+            }
             return item
         }
         collectionView.collectionViewLayout = layout
@@ -294,8 +306,15 @@ final class GIFPickerViewController: NSViewController {
     }
 
     func prepareForPresentation() {
+        isPreparingPresentation = true
         playbackResumeTask?.cancel()
+        searchWarmupTask?.cancel()
+        searchWarmupTask = Task(priority: .userInitiated) { [search, library] in
+            await search.prepareForPresentation(library.favorites)
+        }
         setPlaybackEnabled(false)
+        collectionView.layoutSubtreeIfNeeded()
+        configureVisibleItemsForPresentation()
         for case let item as GIFCollectionItem in collectionView.visibleItems() {
             item.restorePosterIfNeeded()
         }
@@ -319,7 +338,9 @@ final class GIFPickerViewController: NSViewController {
     }
 
     func didPresent() {
+        isPreparingPresentation = false
         isPresented = true
+        lastObservedScrollOrigin = scrollView.contentView.bounds.origin
         for case let item as GIFCollectionItem in collectionView.visibleItems() {
             item.restorePosterIfNeeded()
         }
@@ -358,9 +379,12 @@ final class GIFPickerViewController: NSViewController {
     }
 
     func didDismiss() {
+        isPreparingPresentation = false
         isPresented = false
         searchTask?.cancel()
         searchTask = nil
+        searchWarmupTask?.cancel()
+        searchWarmupTask = nil
         playbackResumeTask?.cancel()
         playbackResumeTask = nil
         scrollPlaybackRecoveryTask?.cancel()
@@ -397,8 +421,26 @@ final class GIFPickerViewController: NSViewController {
         }
     }
 
+    private func configureVisibleItemsForPresentation() {
+        for case let item as GIFCollectionItem in collectionView.visibleItems() {
+            guard let indexPath = collectionView.indexPath(for: item),
+                let id = dataSource.itemIdentifier(for: indexPath),
+                let favorite = displayedFavorites[id]
+            else { continue }
+            let isSameFavorite = item.favoriteID == favorite.id
+            if !isSameFavorite { item.setPlaybackEnabled(false) }
+            item.configure(with: favorite, searchResult: displayedSearchResults[id])
+        }
+    }
+
     @objc private func scrollBoundsChanged(_ notification: Notification) {
         guard isPresented, playbackEnabled else { return }
+        let origin = scrollView.contentView.bounds.origin
+        guard
+            abs(origin.x - lastObservedScrollOrigin.x) > 0.5
+                || abs(origin.y - lastObservedScrollOrigin.y) > 0.5
+        else { return }
+        lastObservedScrollOrigin = origin
         scrollPlaybackRecoveryTask?.cancel()
         scrollPlaybackRecoveryTask = Task { [weak self] in
             // Coalesce momentum-scroll notifications, then ask AppKit for the
@@ -508,10 +550,7 @@ final class GIFPickerViewController: NSViewController {
         updateCountLabel()
         updateEmptyState()
         let favorites = library.filteredFavorites
-        let nextSearchResults = Dictionary(
-            uniqueKeysWithValues: favorites.compactMap { favorite in
-                library.searchResult(for: favorite.id).map { (favorite.id, $0) }
-            })
+        let nextSearchResults = library.activeSearchResults
         if favorites == displayedOrder {
             guard nextSearchResults != displayedSearchResults else {
                 if shouldScrollToTop { scrollToTop() }
@@ -552,24 +591,28 @@ final class GIFPickerViewController: NSViewController {
             snapshot.appendSections([0])
             snapshot.appendItems(nextIDs, toSection: 0)
         }
-        // Waterfall positions depend on the complete ordered result set. AppKit's
-        // animated diff can otherwise move a reused item using its old height while
-        // the layout is still describing the previous snapshot, briefly overlapping
-        // the item below it. Install the snapshot atomically, then rebuild geometry.
-        dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
-            guard let self else { return }
-            if layoutChanged {
-                self.layout.invalidateLayout()
+        // AppKit's nonanimated diff path rebuilds every visible item, including
+        // unchanged identifiers, which resets each GIF/video playback timeline.
+        // Request the identity-preserving diff algorithm inside a zero-duration
+        // context, then atomically rebuild the waterfall geometry on completion.
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            dataSource.apply(snapshot, animatingDifferences: true) { [weak self] in
+                guard let self else { return }
+                if layoutChanged {
+                    self.layout.invalidateLayout()
+                }
+                self.collectionView.needsLayout = true
+                self.view.needsLayout = true
+                self.collectionView.layoutSubtreeIfNeeded()
+                if shouldScrollToTop { self.scrollToTop() }
             }
-            self.collectionView.needsLayout = true
-            self.view.needsLayout = true
-            self.collectionView.layoutSubtreeIfNeeded()
-            if shouldScrollToTop { self.scrollToTop() }
         }
     }
 
     private func scrollToTop() {
         let clipView = scrollView.contentView
+        guard abs(clipView.bounds.origin.y) > 0.5 else { return }
         clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: 0))
         scrollView.reflectScrolledClipView(clipView)
     }
@@ -691,8 +734,7 @@ extension GIFPickerViewController: NSSearchFieldDelegate {
             return
         }
         library.setQuery(query, preservingVisibleResults: true)
-        searchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(100))
+        searchTask = Task(priority: .userInitiated) { [weak self] in
             guard !Task.isCancelled, let self else { return }
             await refreshCurrentSearch(shouldScrollToTop: true)
         }

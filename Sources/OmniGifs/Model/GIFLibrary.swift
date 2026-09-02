@@ -8,6 +8,8 @@ final class GIFLibrary {
     private(set) var filteredFavorites: [GIFFavorite] = []
     private(set) var query = ""
     private var hiddenIDs: Set<String> = []
+    private var availableFavorites: [GIFFavorite] = []
+    private var availableFavoritesByID: [String: GIFFavorite] = [:]
     private var rankedIDs: [String]?
     private var searchResults: [String: GIFSearchResult] = [:]
 
@@ -41,6 +43,7 @@ final class GIFLibrary {
             try data.write(to: cacheURL, options: .atomic)
         }
         favorites = decoded
+        rebuildAvailableFavorites()
         applyFilter()
         onChange?()
         return true
@@ -54,6 +57,8 @@ final class GIFLibrary {
         filteredFavorites = []
         query = ""
         hiddenIDs = []
+        availableFavorites = []
+        availableFavoritesByID = [:]
         rankedIDs = nil
         searchResults = [:]
         onChange?()
@@ -76,6 +81,7 @@ final class GIFLibrary {
     func setHiddenIDs(_ ids: Set<String>) {
         guard hiddenIDs != ids else { return }
         hiddenIDs = ids
+        rebuildAvailableFavorites()
         applyFilter()
         onChange?()
     }
@@ -102,30 +108,30 @@ final class GIFLibrary {
         query.isEmpty ? nil : searchResults[id]
     }
 
+    /// Dictionaries are copy-on-write, so the picker can compare the current
+    /// metadata snapshot without rebuilding it from every visible favorite.
+    var activeSearchResults: [String: GIFSearchResult] {
+        query.isEmpty ? [:] : searchResults
+    }
+
     private func applyFilter() {
         guard !query.isEmpty else {
-            filteredFavorites = favorites.filter { !hiddenIDs.contains($0.id) }
+            filteredFavorites = availableFavorites
             return
         }
         if let rankedIDs {
-            let byID = Dictionary(
-                uniqueKeysWithValues:
-                    favorites
-                    .filter { !hiddenIDs.contains($0.id) }
-                    .map { ($0.id, $0) })
-            filteredFavorites = rankedIDs.compactMap { byID[$0] }
+            filteredFavorites = rankedIDs.compactMap { availableFavoritesByID[$0] }
             return
         }
         let needle = query.folding(
             options: [.caseInsensitive, .diacriticInsensitive],
             locale: .current
         )
-        filteredFavorites = favorites.filter {
-            !hiddenIDs.contains($0.id)
-                && $0.sourceURL.absoluteString.folding(
-                    options: [.caseInsensitive, .diacriticInsensitive],
-                    locale: .current
-                ).contains(needle)
+        filteredFavorites = availableFavorites.filter {
+            $0.sourceURL.absoluteString.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            ).contains(needle)
         }
     }
 
@@ -134,6 +140,14 @@ final class GIFLibrary {
             let decoded = try? GIFImporter.decodeSnapshot(data)
         else { return }
         favorites = decoded
-        filteredFavorites = decoded
+        rebuildAvailableFavorites()
+        filteredFavorites = availableFavorites
+    }
+
+    private func rebuildAvailableFavorites() {
+        availableFavorites = favorites.filter { !hiddenIDs.contains($0.id) }
+        availableFavoritesByID = Dictionary(
+            uniqueKeysWithValues: availableFavorites.map { ($0.id, $0) }
+        )
     }
 }
