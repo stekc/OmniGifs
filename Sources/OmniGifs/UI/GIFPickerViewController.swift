@@ -707,6 +707,7 @@ extension GIFPickerViewController: NSCollectionViewDelegate {
             indexPath.item < library.filteredFavorites.count
         else { return }
         delegate?.gifPicker(self, didChoose: library.filteredFavorites[indexPath.item])
+        collectionView.deselectItems(at: indexPaths)
     }
 }
 
