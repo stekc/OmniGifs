@@ -9,32 +9,31 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     private let popover = NSPopover()
     private var picker: GIFPickerViewController
     private let discordSession: DiscordSessionCoordinator
+    private let settings = AppSettings.shared
     private var pickerIsPresented = false
     private var previousApp: NSRunningApplication?
-    private static let autoPasteKey = "autoPasteEnabled"
-    private static let globalHotKeyKey = "globalHotKeyEnabled"
     private lazy var globalHotKey = GlobalHotKey { [weak self] in
         self?.toggleFromHotKey()
     }
+    private lazy var settingsWindowController = SettingsWindowController(
+        settings: settings,
+        configureShortcut: { [weak self] enabled, shortcut in
+            self?.configureGlobalShortcut(enabled: enabled, shortcut: shortcut) ?? false
+        },
+        requestAccessibilityAccess: { [weak self] in
+            self?.requestAccessibilityTrust() ?? false
+        }
+    )
     private lazy var discordMenuItem = NSMenuItem(
-        title: "Log In to Discord",
+        title: "Log In",
         action: #selector(logInToDiscord),
         keyEquivalent: ""
     )
-    private lazy var autoPasteMenuItem: NSMenuItem = {
+    private lazy var settingsMenuItem: NSMenuItem = {
         let item = NSMenuItem(
-            title: "Paste without copying",
-            action: #selector(toggleAutoPaste),
-            keyEquivalent: ""
-        )
-        item.target = self
-        return item
-    }()
-    private lazy var globalHotKeyMenuItem: NSMenuItem = {
-        let item = NSMenuItem(
-            title: "Open with ⌘⇧G",
-            action: #selector(toggleGlobalHotKey),
-            keyEquivalent: ""
+            title: "Settings…",
+            action: #selector(showSettings),
+            keyEquivalent: ","
         )
         item.target = self
         return item
@@ -44,8 +43,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         discordMenuItem.target = self
         menu.addItem(discordMenuItem)
         menu.addItem(.separator())
-        menu.addItem(autoPasteMenuItem)
-        menu.addItem(globalHotKeyMenuItem)
+        menu.addItem(settingsMenuItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit OmniGifs",
@@ -70,6 +68,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         picker.delegate = self
         picker.preferredContentSize = NSSize(width: 526, height: 650)
         configurePopover()
+        configureMainMenu()
         picker.startInitialRefresh()
 
         if let button = statusItem.button {
@@ -88,8 +87,10 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         }
         statusItem.autosaveName = "win.stkc.omnigifs.status-item"
 
-        if globalHotKeyEnabled {
-            globalHotKey.register()
+        if settings.globalShortcutEnabled,
+            !globalHotKey.register(settings.globalShortcut)
+        {
+            settings.globalShortcutEnabled = false
         }
     }
 
@@ -99,8 +100,6 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
             let button = statusItem.button
         {
             updateDiscordMenuItem()
-            autoPasteMenuItem.state = autoPasteEnabled ? .on : .off
-            globalHotKeyMenuItem.state = globalHotKeyEnabled ? .on : .off
             NSMenu.popUpContextMenu(contextMenu, with: event, for: button)
             return
         }
@@ -118,30 +117,23 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         NSApp.terminate(nil)
     }
 
-    private var autoPasteEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.autoPasteKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.autoPasteKey) }
-    }
-
-    @objc private func toggleAutoPaste() {
-        autoPasteEnabled.toggle()
-        if autoPasteEnabled {
-            requestAccessibilityTrust()
+    @objc private func showSettings() {
+        if popover.isShown {
+            dismissPickerIfNeeded()
+            popover.performClose(nil)
         }
+        settingsWindowController.showWindow(nil)
     }
 
-    private var globalHotKeyEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: Self.globalHotKeyKey) as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: Self.globalHotKeyKey) }
-    }
-
-    @objc private func toggleGlobalHotKey() {
-        globalHotKeyEnabled.toggle()
-        if globalHotKeyEnabled {
-            globalHotKey.register()
-        } else {
+    private func configureGlobalShortcut(
+        enabled: Bool,
+        shortcut: GlobalShortcut
+    ) -> Bool {
+        guard enabled else {
             globalHotKey.unregister()
+            return true
         }
+        return globalHotKey.register(shortcut)
     }
 
     private func toggleFromHotKey() {
@@ -154,9 +146,10 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func requestAccessibilityTrust() {
-        guard !AXIsProcessTrusted() else { return }
+    private func requestAccessibilityTrust() -> Bool {
+        guard !AXIsProcessTrusted() else { return true }
         _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        return AXIsProcessTrusted()
     }
 
     @objc private func logInToDiscord() {
@@ -182,10 +175,10 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
 
     private func updateDiscordMenuItem() {
         if discordSession.state == .connected {
-            discordMenuItem.title = "Log Out of Discord"
+            discordMenuItem.title = "Log Out"
             discordMenuItem.action = #selector(logOutOfDiscord)
         } else {
-            discordMenuItem.title = "Log In to Discord"
+            discordMenuItem.title = "Log In"
             discordMenuItem.action = #selector(logInToDiscord)
         }
     }
@@ -195,6 +188,8 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         let front = NSWorkspace.shared.frontmostApplication
         if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApp = front
+        } else {
+            previousApp = nil
         }
         if popover.contentViewController == nil {
             popover.contentViewController = picker
@@ -233,16 +228,84 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     func gifPicker(_ picker: GIFPickerViewController, didChoose favorite: GIFFavorite) {
         dismissPickerIfNeeded()
         popover.performClose(nil)
-        let pasteRequested = autoPasteEnabled || NSEvent.modifierFlags.contains(.shift)
+        let pasteRequested = settings.shouldPasteSelection(
+            shiftPressed: NSEvent.modifierFlags.contains(.shift)
+        )
         guard pasteRequested else {
             GIFSelectionWriter.copySourceURL(of: favorite)
             return
         }
-        requestAccessibilityTrust()
-        previousApp?.activate()
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(150))
-            GIFSelectionWriter.pasteSourceURL(of: favorite)
+        guard requestAccessibilityTrust(), let target = previousApp else {
+            GIFSelectionWriter.copySourceURL(of: favorite)
+            return
         }
+        previousApp = nil
+        Task { [weak self] in
+            await self?.paste(favorite, into: target)
+        }
+    }
+
+    private func paste(_ favorite: GIFFavorite, into target: NSRunningApplication) async {
+        guard !target.isTerminated, target.activate() else {
+            GIFSelectionWriter.copySourceURL(of: favorite)
+            return
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while NSWorkspace.shared.frontmostApplication?.processIdentifier
+            != target.processIdentifier
+        {
+            guard clock.now < deadline, !target.isTerminated else {
+                GIFSelectionWriter.copySourceURL(of: favorite)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        guard
+            NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == target.processIdentifier,
+            GIFSelectionWriter.pasteSourceURL(of: favorite)
+        else {
+            GIFSelectionWriter.copySourceURL(of: favorite)
+            return
+        }
+    }
+
+    private func configureMainMenu() {
+        let mainMenu = NSMenu()
+        let applicationItem = NSMenuItem()
+        let applicationMenu = NSMenu()
+
+        let aboutItem = NSMenuItem(
+            title: "About OmniGifs",
+            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+            keyEquivalent: ""
+        )
+        aboutItem.target = NSApp
+        applicationMenu.addItem(aboutItem)
+        applicationMenu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(
+            title: "Settings…",
+            action: #selector(showSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        applicationMenu.addItem(settingsItem)
+        applicationMenu.addItem(.separator())
+
+        let quitItem = NSMenuItem(
+            title: "Quit OmniGifs",
+            action: #selector(quitApplication),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        applicationMenu.addItem(quitItem)
+
+        applicationItem.submenu = applicationMenu
+        mainMenu.addItem(applicationItem)
+        NSApp.mainMenu = mainMenu
     }
 }
