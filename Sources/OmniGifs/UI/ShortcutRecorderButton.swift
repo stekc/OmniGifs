@@ -21,7 +21,7 @@ final class ShortcutRecorderButton: NSButton {
         setButtonType(.momentaryPushIn)
         target = self
         action = #selector(beginRecording)
-        toolTip = "Click, then type a keyboard shortcut"
+        toolTip = "Record a keyboard shortcut"
         setAccessibilityLabel("Keyboard shortcut")
     }
 
@@ -34,7 +34,7 @@ final class ShortcutRecorderButton: NSButton {
 
     @objc private func beginRecording() {
         isRecording = true
-        title = "Type Shortcut"
+        title = "Press Shortcut"
         window?.makeFirstResponder(self)
     }
 

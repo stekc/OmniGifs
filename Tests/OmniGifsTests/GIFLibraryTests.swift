@@ -5,6 +5,33 @@ import Testing
 
 @MainActor
 struct GIFLibraryTests {
+    @Test func metadataFiltersComposeWithSearchAndTagsAreSearchable() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OmniGifsLibraryTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = GIFLibrary(
+            cacheURL: directory.appendingPathComponent("Favorites.json"),
+            metadataDatabaseURL: directory.appendingPathComponent("Search.sqlite3")
+        )
+        let data = Data(
+            #"[{"url":"https://example.com/one"},{"url":"https://example.com/two"}]"#.utf8
+        )
+        try library.replace(with: data, persist: false)
+        let folder = try library.createFolder(named: "Lorem")
+        let tag = try library.createTag(named: "Ipsum")
+        try library.assign("https://example.com/one", toFolder: folder.id)
+        try library.toggleTag(tag.id, for: "https://example.com/one")
+
+        #expect(library.tagSearchSnapshot.matchingIDs("ipsum") == ["https://example.com/one"])
+        #expect(library.tagSearchSnapshot.matchingIDs("lorem").isEmpty)
+
+        try library.selectFolderFilter(folder.id)
+        #expect(library.filteredFavorites.map(\.id) == ["https://example.com/one"])
+        library.setQuery("example")
+        library.applyRankedIDs(["https://example.com/two", "https://example.com/one"])
+        #expect(library.filteredFavorites.map(\.id) == ["https://example.com/one"])
+    }
+
     @Test func oneCharacterQueryDoesNotSearchOrShowMatchMetadata() throws {
         let cacheURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("OmniGifsTests-\(UUID().uuidString).json")

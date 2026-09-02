@@ -25,7 +25,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         }
     )
     private lazy var discordMenuItem = NSMenuItem(
-        title: "Log In",
+        title: "Log In…",
         action: #selector(logInToDiscord),
         keyEquivalent: ""
     )
@@ -81,9 +81,10 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
             ), let icon = NSImage(contentsOf: iconURL) {
                 icon.size = NSSize(width: 18, height: 18)
                 icon.isTemplate = true
-                icon.accessibilityDescription = "Open OmniGifs"
+                icon.accessibilityDescription = "OmniGifs"
                 button.image = icon
             }
+            button.toolTip = "Open OmniGifs"
             button.target = self
             button.action = #selector(statusItemPressed)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -160,6 +161,18 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     }
 
     @objc private func logOutOfDiscord() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Log Out?"
+        alert.informativeText =
+            "Logging out removes your saved favorites, folders, tags, and search index from this Mac."
+        let logOutButton = alert.addButton(withTitle: "Log Out")
+        logOutButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
         Task {
             await discordSession.logOut()
             do {
@@ -181,7 +194,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
             discordMenuItem.title = "Log Out"
             discordMenuItem.action = #selector(logOutOfDiscord)
         } else {
-            discordMenuItem.title = "Log In"
+            discordMenuItem.title = "Log In…"
             discordMenuItem.action = #selector(logInToDiscord)
         }
     }
@@ -200,6 +213,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
         }
         picker.prepareForPresentation()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        button.toolTip = "Close OmniGifs"
         pickerIsPresented = true
         picker.didPresent()
     }
@@ -225,6 +239,7 @@ final class StatusBarController: NSObject, GIFPickerViewControllerDelegate, NSPo
     private func dismissPickerIfNeeded() {
         guard pickerIsPresented else { return }
         pickerIsPresented = false
+        statusItem.button?.toolTip = "Open OmniGifs"
         picker.didDismiss()
     }
 

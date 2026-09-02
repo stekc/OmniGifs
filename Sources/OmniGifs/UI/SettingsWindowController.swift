@@ -16,7 +16,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     )
     private let autoPasteDescription = SettingsWindowController.descriptionLabel(
         "Paste the selected GIF’s URL into the previously active app without changing the "
-            + "clipboard. This requires Accessibility access."
+            + "clipboard. This requires permission in Accessibility settings."
     )
     private let accessibilityStatus = SettingsWindowController.descriptionLabel("")
     private let shiftCheckbox = NSButton(
@@ -36,6 +36,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let shortcutLabel = NSTextField(labelWithString: "Keyboard shortcut:")
     private let shortcutRecorder: ShortcutRecorderButton
     private let shortcutStatus = SettingsWindowController.descriptionLabel("")
+    private let versionLabel = NSTextField(
+        labelWithString: "Version \(SettingsWindowController.appVersion)"
+    )
+    private let repositoryButton = NSButton(
+        title: "View on GitHub…",
+        target: nil,
+        action: nil
+    )
 
     init(
         settings: AppSettings,
@@ -48,7 +56,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         shortcutRecorder = ShortcutRecorderButton(shortcut: settings.globalShortcut)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 292),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 342),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -89,8 +97,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let separator = NSBox()
         separator.boxType = .separator
+        let footerSeparator = NSBox()
+        footerSeparator.boxType = .separator
         shortcutLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
         shortcutStatus.textColor = .systemRed
+        versionLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        versionLabel.textColor = .secondaryLabelColor
+        repositoryButton.bezelStyle = .inline
+        repositoryButton.controlSize = .small
+        repositoryButton.contentTintColor = .linkColor
+        repositoryButton.target = self
+        repositoryButton.action = #selector(openRepository)
 
         let views: [NSView] = [
             autoPasteCheckbox,
@@ -103,6 +120,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             shortcutLabel,
             shortcutRecorder,
             shortcutStatus,
+            footerSeparator,
+            versionLabel,
+            repositoryButton,
         ]
         for view in views {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -188,6 +208,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             shortcutStatus.leadingAnchor.constraint(equalTo: shortcutLabel.leadingAnchor),
             shortcutStatus.trailingAnchor.constraint(
                 equalTo: content.trailingAnchor, constant: -24),
+            footerSeparator.topAnchor.constraint(
+                greaterThanOrEqualTo: shortcutRecorder.bottomAnchor,
+                constant: 18
+            ),
+            footerSeparator.topAnchor.constraint(
+                equalTo: shortcutStatus.bottomAnchor,
+                constant: 18
+            ),
+            footerSeparator.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor,
+                constant: 24
+            ),
+            footerSeparator.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor,
+                constant: -24
+            ),
+            versionLabel.leadingAnchor.constraint(equalTo: footerSeparator.leadingAnchor),
+            versionLabel.centerYAnchor.constraint(equalTo: repositoryButton.centerYAnchor),
+            repositoryButton.topAnchor.constraint(
+                equalTo: footerSeparator.bottomAnchor,
+                constant: 14
+            ),
+            repositoryButton.widthAnchor.constraint(
+                equalToConstant: repositoryButton.intrinsicContentSize.width + 8
+            ),
+            repositoryButton.trailingAnchor.constraint(equalTo: footerSeparator.trailingAnchor),
+            repositoryButton.bottomAnchor.constraint(
+                lessThanOrEqualTo: content.bottomAnchor,
+                constant: -16
+            ),
         ])
     }
 
@@ -243,8 +293,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         accessibilityStatus.stringValue =
             AXIsProcessTrusted()
-            ? "Accessibility access is enabled."
-            : "Until you grant Accessibility access, OmniGifs copies the URL instead."
+            ? "OmniGifs has Accessibility access."
+            : "Until you allow OmniGifs in Accessibility settings, it copies the URL instead."
+    }
+
+    @objc private func openRepository() {
+        guard let url = URL(string: "https://github.com/stekc/OmniGifs") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private static var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "Development"
     }
 
     private static func descriptionLabel(_ value: String) -> NSTextField {

@@ -18,7 +18,7 @@ struct GIFPickerLifecycleTests {
         let button = try #require(
             picker.view.descendants
                 .compactMap { $0 as? NSButton }
-                .first { $0.title == "Log In" }
+                .first { $0.title == "Log In…" }
         )
         #expect(!button.isHidden)
     }

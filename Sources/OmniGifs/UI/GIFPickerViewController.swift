@@ -2,6 +2,68 @@ import AppKit
 import Darwin
 import OSLog
 
+private final class SearchFieldStyleButton: NSButton {
+    private let backgroundField = NSSearchField()
+    private let iconView = NSImageView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureSubviews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureSubviews()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0, bounds.contains(point) else { return nil }
+        return self
+    }
+
+    func setIcon(_ image: NSImage?) {
+        iconView.image = image
+    }
+
+    func setIconTint(_ color: NSColor) {
+        iconView.contentTintColor = color
+    }
+
+    private func configureSubviews() {
+        isBordered = false
+        title = ""
+
+        backgroundField.translatesAutoresizingMaskIntoConstraints = false
+        backgroundField.controlSize = .large
+        backgroundField.stringValue = ""
+        backgroundField.placeholderString = ""
+        backgroundField.focusRingType = .none
+        backgroundField.isEditable = false
+        backgroundField.isSelectable = false
+        backgroundField.refusesFirstResponder = true
+        if let cell = backgroundField.cell as? NSSearchFieldCell {
+            cell.searchButtonCell = nil
+            cell.cancelButtonCell = nil
+        }
+        addSubview(backgroundField)
+
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.contentTintColor = .secondaryLabelColor
+        addSubview(iconView)
+        NSLayoutConstraint.activate([
+            backgroundField.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backgroundField.trailingAnchor.constraint(equalTo: trailingAnchor),
+            backgroundField.topAnchor.constraint(equalTo: topAnchor),
+            backgroundField.bottomAnchor.constraint(equalTo: bottomAnchor),
+            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            iconView.heightAnchor.constraint(equalToConstant: 18),
+        ])
+    }
+}
+
 @MainActor
 protocol GIFPickerViewControllerDelegate: AnyObject {
     func gifPicker(_ picker: GIFPickerViewController, didChoose favorite: GIFFavorite)
@@ -9,6 +71,18 @@ protocol GIFPickerViewControllerDelegate: AnyObject {
 
 @MainActor
 final class GIFPickerViewController: NSViewController {
+    private final class MetadataCommand: NSObject {
+        let favoriteIDs: [String]
+        let groupID: UUID?
+        let assignsTag: Bool?
+
+        init(favoriteIDs: [String], groupID: UUID? = nil, assignsTag: Bool? = nil) {
+            self.favoriteIDs = favoriteIDs
+            self.groupID = groupID
+            self.assignsTag = assignsTag
+        }
+    }
+
     private static let refreshInterval: TimeInterval = 5 * 60
     private static var lastRefreshAt: Date?
     private static let logger = Logger(subsystem: "win.stkc.omnigifs", category: "Picker")
@@ -19,9 +93,10 @@ final class GIFPickerViewController: NSViewController {
     private let session: DiscordSessionCoordinator
     private let search: SearchCoordinator
 
-    private let collectionView = NSCollectionView()
+    private let collectionView = GIFCollectionView()
     private let scrollView = NSScrollView()
     private let searchField = CommandSearchField()
+    private let filterButton = SearchFieldStyleButton()
     private let reloadButton = NSButton()
     private let reloadIcon = PassThroughImageView()
     private let activityIndicator = PassThroughProgressIndicator()
@@ -31,6 +106,7 @@ final class GIFPickerViewController: NSViewController {
     private let emptyLoginButton = NSButton()
     private let layout = WaterfallLayout()
     private let liveItems = NSHashTable<GIFCollectionItem>.weakObjects()
+    private var filterPopover: NSPopover?
     private var dataSource: NSCollectionViewDiffableDataSource<Int, String>!
     private var displayedFavorites: [String: GIFFavorite] = [:]
     private var displayedOrder: [GIFFavorite] = []
@@ -103,6 +179,21 @@ final class GIFPickerViewController: NSViewController {
         searchField.delegate = self
         searchField.controlSize = .large
 
+        filterButton.title = ""
+        filterButton.setIcon(
+            NSImage(
+                systemSymbolName: "line.3.horizontal.decrease",
+                accessibilityDescription: nil
+            )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+        )
+        filterButton.controlSize = .large
+        filterButton.setIconTint(.secondaryLabelColor)
+        filterButton.refusesFirstResponder = true
+        filterButton.toolTip = "Filter favorites"
+        filterButton.setAccessibilityLabel("Filter favorites")
+        filterButton.target = self
+        filterButton.action = #selector(showFilterPopover)
+
         reloadButton.title = ""
         reloadButton.isBordered = false
         reloadButton.refusesFirstResponder = true
@@ -151,7 +242,7 @@ final class GIFPickerViewController: NSViewController {
 
         let headerContent = NSView()
         headerContent.translatesAutoresizingMaskIntoConstraints = false
-        for subview in [titleStack, searchField, reloadContainer] {
+        for subview in [titleStack, filterButton, searchField, reloadContainer] {
             subview.translatesAutoresizingMaskIntoConstraints = false
             headerContent.addSubview(subview)
         }
@@ -165,8 +256,12 @@ final class GIFPickerViewController: NSViewController {
                 equalTo: headerContent.trailingAnchor, constant: -4),
             reloadContainer.centerYAnchor.constraint(
                 equalTo: titleStack.centerYAnchor, constant: -1),
-            searchField.leadingAnchor.constraint(
+            filterButton.leadingAnchor.constraint(
                 equalTo: headerContent.leadingAnchor, constant: 12),
+            filterButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            filterButton.widthAnchor.constraint(equalToConstant: 34),
+            filterButton.heightAnchor.constraint(equalTo: searchField.heightAnchor),
+            searchField.leadingAnchor.constraint(equalTo: filterButton.trailingAnchor, constant: 4),
             searchField.trailingAnchor.constraint(
                 equalTo: headerContent.trailingAnchor, constant: -12),
             searchField.topAnchor.constraint(equalTo: titleStack.bottomAnchor, constant: 7),
@@ -180,7 +275,7 @@ final class GIFPickerViewController: NSViewController {
         glass.style = .regular
         glass.contentView = headerContent
 
-        emptyLoginButton.title = "Log In"
+        emptyLoginButton.title = "Log In…"
         emptyLoginButton.target = self
         emptyLoginButton.action = #selector(emptyLoginButtonPressed)
         emptyLoginButton.bezelStyle = .rounded
@@ -197,7 +292,7 @@ final class GIFPickerViewController: NSViewController {
         collectionView.autoresizingMask = [.width]
         collectionView.delegate = self
         collectionView.isSelectable = true
-        collectionView.allowsMultipleSelection = false
+        collectionView.allowsMultipleSelection = true
         collectionView.backgroundColors = [.clear]
         dataSource = NSCollectionViewDiffableDataSource<Int, String>(
             collectionView: collectionView
@@ -232,6 +327,24 @@ final class GIFPickerViewController: NSViewController {
             GIFCollectionItem.self,
             forItemWithIdentifier: GIFCollectionItem.identifier
         )
+        collectionView.menuProvider = { [weak self] indexPath in
+            guard let self else { return nil }
+            let selectedPaths = collectionView.selectionIndexPaths
+            let targetPaths: Set<IndexPath> =
+                selectedPaths.contains(indexPath) ? selectedPaths : [indexPath]
+            let ids = targetPaths.sorted { $0.item < $1.item }.compactMap {
+                dataSource.itemIdentifier(for: $0)
+            }
+            return ids.isEmpty ? nil : metadataMenu(for: ids)
+        }
+        collectionView.primaryClickHandler = { [weak self] indexPath in
+            guard let self,
+                let id = dataSource.itemIdentifier(for: indexPath),
+                let favorite = displayedFavorites[id]
+            else { return }
+            delegate?.gifPicker(self, didChoose: favorite)
+            collectionView.deselectAll(nil)
+        }
 
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = collectionView
@@ -281,6 +394,7 @@ final class GIFPickerViewController: NSViewController {
             }
         }
         reloadLibrary()
+        updateFilterButton()
         updateSessionState(session.state)
     }
 
@@ -307,10 +421,14 @@ final class GIFPickerViewController: NSViewController {
 
     func prepareForPresentation() {
         isPreparingPresentation = true
+        clearSelection()
         playbackResumeTask?.cancel()
         searchWarmupTask?.cancel()
         searchWarmupTask = Task(priority: .userInitiated) { [search, library] in
-            await search.prepareForPresentation(library.favorites)
+            await search.prepareForPresentation(
+                library.favorites,
+                tagSnapshot: library.tagSearchSnapshot
+            )
         }
         setPlaybackEnabled(false)
         collectionView.layoutSubtreeIfNeeded()
@@ -381,6 +499,9 @@ final class GIFPickerViewController: NSViewController {
     func didDismiss() {
         isPreparingPresentation = false
         isPresented = false
+        filterPopover?.close()
+        filterPopover = nil
+        clearSelection()
         searchTask?.cancel()
         searchTask = nil
         searchWarmupTask?.cancel()
@@ -410,6 +531,13 @@ final class GIFPickerViewController: NSViewController {
         }
         Task {
             await WebPVideoTranscoder.shared.cancelAll()
+        }
+    }
+
+    private func clearSelection() {
+        collectionView.selectionIndexPaths = []
+        for case let item as GIFCollectionItem in collectionView.visibleItems() {
+            item.isSelected = false
         }
     }
 
@@ -528,7 +656,11 @@ final class GIFPickerViewController: NSViewController {
         if library.query != query {
             library.setQuery(query, preservingVisibleResults: true)
         }
-        let results = await search.search(query, among: library.favorites)
+        let results = await search.search(
+            query,
+            among: library.favorites,
+            tagSnapshot: library.tagSearchSnapshot
+        )
         guard !Task.isCancelled,
             isPresented,
             query == SearchQueryPolicy.normalized(searchField.stringValue)
@@ -617,6 +749,214 @@ final class GIFPickerViewController: NSViewController {
         scrollView.reflectScrolledClipView(clipView)
     }
 
+    @objc private func showFilterPopover() {
+        if filterPopover?.isShown == true {
+            filterPopover?.close()
+            return
+        }
+        let controller = MetadataFilterViewController(library: library)
+        controller.onFilterChange = { [weak self] in
+            self?.collectionView.deselectAll(nil)
+            self?.updateFilterButton()
+            self?.scrollToTop()
+        }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = false
+        popover.contentViewController = controller
+        filterPopover = popover
+        popover.show(relativeTo: filterButton.bounds, of: filterButton, preferredEdge: .minY)
+    }
+
+    private func metadataMenu(for favoriteIDs: [String]) -> NSMenu {
+        let menu = NSMenu()
+        if favoriteIDs.count > 1 {
+            let summary = NSMenuItem(
+                title: "\(favoriteIDs.count) GIFs Selected",
+                action: nil,
+                keyEquivalent: ""
+            )
+            summary.isEnabled = false
+            menu.addItem(summary)
+            menu.addItem(.separator())
+        }
+
+        let folderItem = NSMenuItem(title: "Add to Folder", action: nil, keyEquivalent: "")
+        let folderMenu = NSMenu(title: "Add to Folder")
+        let none = NSMenuItem(
+            title: "No Folder",
+            action: #selector(assignFolder(_:)),
+            keyEquivalent: ""
+        )
+        none.target = self
+        let unfiledCount = favoriteIDs.count(where: { library.folderID(for: $0) == nil })
+        none.state =
+            unfiledCount == favoriteIDs.count ? .on : (unfiledCount == 0 ? .off : .mixed)
+        none.representedObject = MetadataCommand(favoriteIDs: favoriteIDs)
+        folderMenu.addItem(none)
+        for folder in library.folders {
+            let assignedCount = favoriteIDs.count(where: {
+                library.folderID(for: $0) == folder.id
+            })
+            let item = NSMenuItem(
+                title: folder.name,
+                action: #selector(assignFolder(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.state =
+                assignedCount == favoriteIDs.count ? .on : (assignedCount == 0 ? .off : .mixed)
+            item.representedObject = MetadataCommand(
+                favoriteIDs: favoriteIDs,
+                groupID: folder.id
+            )
+            folderMenu.addItem(item)
+        }
+        folderMenu.addItem(.separator())
+        let newFolder = NSMenuItem(
+            title: "New Folder…",
+            action: #selector(createFolder(_:)),
+            keyEquivalent: ""
+        )
+        newFolder.target = self
+        newFolder.representedObject = MetadataCommand(favoriteIDs: favoriteIDs)
+        folderMenu.addItem(newFolder)
+        folderItem.submenu = folderMenu
+        menu.addItem(folderItem)
+
+        let tagItem = NSMenuItem(title: "Add Tag", action: nil, keyEquivalent: "")
+        let tagMenu = NSMenu(title: "Add Tag")
+        for tag in library.tags {
+            let assignedCount = favoriteIDs.count(where: {
+                library.tagIDs(for: $0).contains(tag.id)
+            })
+            let item = NSMenuItem(
+                title: tag.name,
+                action: #selector(toggleFavoriteTag(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.state =
+                assignedCount == favoriteIDs.count ? .on : (assignedCount == 0 ? .off : .mixed)
+            item.representedObject = MetadataCommand(
+                favoriteIDs: favoriteIDs,
+                groupID: tag.id,
+                assignsTag: assignedCount != favoriteIDs.count
+            )
+            tagMenu.addItem(item)
+        }
+        if !library.tags.isEmpty { tagMenu.addItem(.separator()) }
+        let newTag = NSMenuItem(
+            title: "New Tag…",
+            action: #selector(createTag(_:)),
+            keyEquivalent: ""
+        )
+        newTag.target = self
+        newTag.representedObject = MetadataCommand(favoriteIDs: favoriteIDs, assignsTag: true)
+        tagMenu.addItem(newTag)
+        tagItem.submenu = tagMenu
+        menu.addItem(tagItem)
+        return menu
+    }
+
+    @objc private func assignFolder(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? MetadataCommand,
+            !command.favoriteIDs.isEmpty
+        else { return }
+        performMetadataChange {
+            try library.assign(command.favoriteIDs, toFolder: command.groupID)
+        }
+    }
+
+    @objc private func toggleFavoriteTag(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? MetadataCommand,
+            let tagID = command.groupID,
+            let assigned = command.assignsTag,
+            !command.favoriteIDs.isEmpty
+        else { return }
+        performMetadataChange(requiresSearchRefresh: true) {
+            try library.setTag(tagID, for: command.favoriteIDs, assigned: assigned)
+        }
+    }
+
+    @objc private func createFolder(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? MetadataCommand,
+            !command.favoriteIDs.isEmpty,
+            let name = promptForName(
+                title: "New Folder",
+                message: "Enter a name for the folder.",
+                fieldLabel: "Folder Name"
+            )
+        else { return }
+        performMetadataChange {
+            let folder = try library.createFolder(named: name)
+            try library.assign(command.favoriteIDs, toFolder: folder.id)
+        }
+    }
+
+    @objc private func createTag(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? MetadataCommand,
+            !command.favoriteIDs.isEmpty,
+            let name = promptForName(
+                title: "New Tag",
+                message: "Enter a name for the tag.",
+                fieldLabel: "Tag Name"
+            )
+        else { return }
+        performMetadataChange(requiresSearchRefresh: true) {
+            let tag = try library.createTag(named: name)
+            try library.setTag(tag.id, for: command.favoriteIDs, assigned: true)
+        }
+    }
+
+    private func performMetadataChange(
+        requiresSearchRefresh: Bool = false,
+        _ change: () throws -> Void
+    ) {
+        do {
+            try change()
+            updateFilterButton()
+            guard requiresSearchRefresh,
+                SearchQueryPolicy.isSearchable(searchField.stringValue)
+            else { return }
+            searchTask?.cancel()
+            searchTask = Task(priority: .userInitiated) { [weak self] in
+                guard !Task.isCancelled, let self else { return }
+                await refreshCurrentSearch()
+            }
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.messageText = "Couldn’t Save Changes"
+            alert.runModal()
+        }
+    }
+
+    private func promptForName(title: String, message: String, fieldLabel: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = fieldLabel
+        field.setAccessibilityLabel(fieldLabel)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return field.stringValue
+    }
+
+    private func updateFilterButton() {
+        filterButton.setIconTint(
+            library.hasActiveMetadataFilter ? .controlAccentColor : .secondaryLabelColor
+        )
+        let description =
+            library.hasActiveMetadataFilter ? "Change active filters" : "Filter favorites"
+        filterButton.toolTip = description
+        filterButton.setAccessibilityLabel(description)
+    }
+
     private func updateIndexProgress(_ progress: SearchIndexProgress) {
         indexProgress = progress
         updateCountLabel()
@@ -624,19 +964,19 @@ final class GIFPickerViewController: NSViewController {
 
     private func updateCountLabel() {
         let count = library.filteredFavorites.count
-        countLabel.stringValue = "(\(count) GIFs)"
+        countLabel.stringValue = "(\(count) \(count == 1 ? "GIF" : "GIFs"))"
         let status: String?
         let isBusy: Bool
         switch indexProgress {
         case .refreshingFavorites:
-            status = "Refreshing…"
+            status = "Refreshing favorites…"
             isBusy = true
         case .checking:
             status = "Checking index…"
             isBusy = true
         case .indexing(let completed, let total, let semantic):
-            let mode = semantic ? "AI + OCR" : "OCR"
-            status = "Indexing \(mode) \(completed)/\(total)"
+            let mode = semantic ? "AI and OCR" : "OCR"
+            status = "Indexing \(mode): \(completed) of \(total)"
             isBusy = true
         case .ready:
             status = sessionStatusText
@@ -663,7 +1003,7 @@ final class GIFPickerViewController: NSViewController {
     private var sessionStatusText: String? {
         switch session.state {
         case .connected: nil
-        case .connecting: "Connecting…"
+        case .connecting: "Connecting to Discord…"
         case .expired: "Session expired"
         // Before the first silent refresh, this means "not checked yet."
         case .notConnected: nil
@@ -677,22 +1017,27 @@ final class GIFPickerViewController: NSViewController {
         switch state {
         case .connected:
             Self.lastRefreshAt = Date()
-            reloadButton.toolTip = "Refresh favorites"
+            setReloadButtonDescription("Refresh favorites")
         case .connecting:
-            reloadButton.toolTip = "Connecting"
+            setReloadButtonDescription("Connecting to Discord")
         case .expired:
-            reloadButton.toolTip = "Log in again"
+            setReloadButtonDescription("Log in again")
         case .notConnected:
             Self.lastRefreshAt = nil
-            reloadButton.toolTip = "Log in"
+            setReloadButtonDescription("Log in")
         case .offline:
-            reloadButton.toolTip = "Retry"
+            setReloadButtonDescription("Retry refreshing favorites")
         }
         updateCountLabel()
         updateEmptyState()
         if shouldRefreshAfterLogin {
             refreshFavorites(forceReload: true)
         }
+    }
+
+    private func setReloadButtonDescription(_ description: String) {
+        reloadButton.toolTip = description
+        reloadButton.setAccessibilityLabel(description)
     }
 
     private func updateEmptyState() {
@@ -721,6 +1066,7 @@ extension GIFPickerViewController: NSSearchFieldDelegate {
 
     func controlTextDidChange(_ notification: Notification) {
         let query = searchField.stringValue
+        collectionView.deselectAll(nil)
         searchTask?.cancel()
         scrollToTop()
         guard SearchQueryPolicy.isSearchable(query) else {
@@ -743,13 +1089,14 @@ extension GIFPickerViewController: NSSearchFieldDelegate {
 
 extension GIFPickerViewController: NSCollectionViewDelegate {
     func collectionView(
-        _ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>
-    ) {
-        guard let indexPath = indexPaths.first,
-            indexPath.item < library.filteredFavorites.count
-        else { return }
-        delegate?.gifPicker(self, didChoose: library.filteredFavorites[indexPath.item])
-        collectionView.deselectItems(at: indexPaths)
+        _ collectionView: NSCollectionView,
+        shouldSelectItemsAt indexPaths: Set<IndexPath>
+    ) -> Set<IndexPath> {
+        guard
+            let gifCollectionView = collectionView as? GIFCollectionView,
+            gifCollectionView.isHandlingCommandSelection
+        else { return [] }
+        return indexPaths
     }
 }
 

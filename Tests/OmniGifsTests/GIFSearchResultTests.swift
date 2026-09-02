@@ -24,8 +24,9 @@ struct GIFSearchResultTests {
             GIFSearchResult(
                 id: "three",
                 matchedURL: false,
+                matchedTag: true,
                 matchedOCR: true,
                 aiSimilarityPercentage: 90
-            ).matchDescription == "OCR, AI (90%)")
+            ).matchDescription == "Tag, OCR, AI (90%)")
     }
 }

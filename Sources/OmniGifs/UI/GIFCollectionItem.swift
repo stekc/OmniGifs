@@ -3,13 +3,59 @@ import AppKit
 
 @MainActor
 final class GIFCollectionItem: NSCollectionViewItem {
+    private final class SelectionOverlay: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            guard bounds.width > 0, bounds.height > 0 else { return }
+
+            let backingScale = window?.backingScaleFactor ?? 2
+            let shortSide = min(bounds.width, bounds.height)
+            let unalignedWidth = min(7, max(4, shortSide * 0.016))
+            var outlineWidth = (unalignedWidth * backingScale).rounded() / backingScale
+            let increasedContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+            if increasedContrast { outlineWidth += 1 }
+
+            let pathInset = outlineWidth / 2
+            let path = NSBezierPath(
+                roundedRect: bounds.insetBy(dx: pathInset, dy: pathInset),
+                xRadius: max(0, 12 - pathInset),
+                yRadius: max(0, 12 - pathInset)
+            )
+            path.lineWidth = outlineWidth
+
+            NSGraphicsContext.saveGraphicsState()
+            let indicatorColor = NSColor.keyboardFocusIndicatorColor
+            let shadow = NSShadow()
+            shadow.shadowColor = indicatorColor.withAlphaComponent(increasedContrast ? 0.25 : 0.55)
+            shadow.shadowBlurRadius = increasedContrast ? 1 : 2
+            shadow.shadowOffset = .zero
+            shadow.set()
+            indicatorColor.setStroke()
+            path.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            needsDisplay = true
+        }
+
+        override func setFrameSize(_ newSize: NSSize) {
+            let sizeChanged = frame.size != newSize
+            super.setFrameSize(newSize)
+            if sizeChanged { needsDisplay = true }
+        }
+    }
+
     static let identifier = NSUserInterfaceItemIdentifier("GIFCollectionItem")
 
     private let imageViewControl = NSImageView()
     private let progress = NSProgressIndicator()
     private let matchOverlay = NSView()
     private let matchLabel = NSTextField(labelWithString: "")
-    private let selectionOverlay = NSView()
+    private let selectionOverlay = SelectionOverlay()
     private var loadTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
     private var representedID: String?
@@ -42,6 +88,11 @@ final class GIFCollectionItem: NSCollectionViewItem {
         imageViewControl.animates = false
         root.addSubview(imageViewControl)
 
+        selectionOverlay.translatesAutoresizingMaskIntoConstraints = false
+        selectionOverlay.identifier = NSUserInterfaceItemIdentifier("GIFSelectionOutline")
+        selectionOverlay.isHidden = !isSelected
+        root.addSubview(selectionOverlay)
+
         progress.translatesAutoresizingMaskIntoConstraints = false
         progress.style = .spinning
         progress.controlSize = .small
@@ -62,15 +113,6 @@ final class GIFCollectionItem: NSCollectionViewItem {
         labelShadow.shadowOffset = NSSize(width: 0, height: -1)
         matchLabel.shadow = labelShadow
         matchOverlay.addSubview(matchLabel)
-
-        selectionOverlay.translatesAutoresizingMaskIntoConstraints = false
-        selectionOverlay.wantsLayer = true
-        selectionOverlay.layer?.borderWidth = 3
-        selectionOverlay.layer?.borderColor = NSColor.controlAccentColor.cgColor
-        selectionOverlay.layer?.cornerRadius = 12
-        selectionOverlay.layer?.cornerCurve = .continuous
-        selectionOverlay.isHidden = true
-        root.addSubview(selectionOverlay)
 
         NSLayoutConstraint.activate([
             imageViewControl.leadingAnchor.constraint(equalTo: root.leadingAnchor),
@@ -107,8 +149,8 @@ final class GIFCollectionItem: NSCollectionViewItem {
         animatedImageLayer?.frame = view.bounds
     }
 
-    override var highlightState: NSCollectionViewItem.HighlightState {
-        didSet { selectionOverlay.isHidden = highlightState != .forSelection }
+    override var isSelected: Bool {
+        didSet { selectionOverlay.isHidden = !isSelected }
     }
 
     var favoriteID: String? { representedID }

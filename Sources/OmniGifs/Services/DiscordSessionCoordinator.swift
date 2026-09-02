@@ -52,7 +52,7 @@ final class DiscordSessionCoordinator: NSObject {
             let controller = NSViewController()
             controller.view = webView
             window = NSWindow(contentViewController: controller)
-            window.title = "Log in to Discord"
+            window.title = "Log In to Discord"
             window.setContentSize(NSSize(width: 1040, height: 760))
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.center()

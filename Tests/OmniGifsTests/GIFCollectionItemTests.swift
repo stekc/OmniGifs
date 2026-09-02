@@ -45,6 +45,18 @@ struct GIFCollectionItemTests {
                 field.stringValue == "OCR, AI (31%)" && field.shadow != nil
             })
         #expect(!containsGradientLayer(in: item.view))
+
+        let selectionOverlay = try #require(
+            views(in: item.view).first {
+                $0.identifier?.rawValue == "GIFSelectionOutline"
+            }
+        )
+        #expect(!(selectionOverlay is NSVisualEffectView))
+        item.isSelected = true
+        #expect(!selectionOverlay.isHidden)
+        item.isSelected = false
+        #expect(selectionOverlay.isHidden)
+
         item.tearDownPlayback()
         item.prepareForReuse()
     }
@@ -59,5 +71,9 @@ struct GIFCollectionItemTests {
     private func containsGradientLayer(in view: NSView) -> Bool {
         if view.layer is CAGradientLayer { return true }
         return view.subviews.contains { containsGradientLayer(in: $0) }
+    }
+
+    private func views(in view: NSView) -> [NSView] {
+        view.subviews.flatMap { [$0] + views(in: $0) }
     }
 }

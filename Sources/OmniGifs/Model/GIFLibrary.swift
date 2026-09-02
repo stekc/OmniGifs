@@ -7,6 +7,7 @@ final class GIFLibrary {
     private(set) var favorites: [GIFFavorite] = []
     private(set) var filteredFavorites: [GIFFavorite] = []
     private(set) var query = ""
+    private(set) var tagSearchSnapshot = GIFTagSearchSnapshot.empty
     private var hiddenIDs: Set<String> = []
     private var availableFavorites: [GIFFavorite] = []
     private var availableFavoritesByID: [String: GIFFavorite] = [:]
@@ -16,10 +17,14 @@ final class GIFLibrary {
     var onChange: (() -> Void)?
 
     private let cacheURL: URL
+    private let metadataStore: GIFMetadataStore
 
-    init(cacheURL: URL? = nil) {
+    init(cacheURL: URL? = nil, metadataDatabaseURL: URL? = nil) {
+        let resolvedMetadataURL: URL
         if let cacheURL {
             self.cacheURL = cacheURL
+            resolvedMetadataURL =
+                metadataDatabaseURL ?? cacheURL.appendingPathExtension("metadata.sqlite3")
         } else {
             let base = FileManager.default.urls(
                 for: .applicationSupportDirectory,
@@ -31,8 +36,94 @@ final class GIFLibrary {
                 withIntermediateDirectories: true
             )
             self.cacheURL = directory.appendingPathComponent("discord-favorites.json")
+            resolvedMetadataURL =
+                metadataDatabaseURL ?? directory.appendingPathComponent("Search.sqlite3")
         }
+        metadataStore = GIFMetadataStore(databaseURL: resolvedMetadataURL)
         loadCachedFavorites()
+    }
+
+    var folders: [GIFFolder] { metadataStore.folders }
+    var tags: [GIFTag] { metadataStore.tags }
+    var selectedFolderID: UUID? { metadataStore.selectedFolderID }
+    var selectedTagIDs: Set<UUID> { metadataStore.selectedTagIDs }
+    var hasActiveMetadataFilter: Bool { metadataStore.hasActiveFilter }
+
+    func folderID(for favoriteID: String) -> UUID? {
+        metadataStore.folderID(for: favoriteID)
+    }
+
+    func tagIDs(for favoriteID: String) -> Set<UUID> {
+        metadataStore.tagIDs(for: favoriteID)
+    }
+
+    @discardableResult
+    func createFolder(named name: String) throws -> GIFFolder {
+        try metadataStore.createFolder(named: name)
+    }
+
+    @discardableResult
+    func createTag(named name: String) throws -> GIFTag {
+        try metadataStore.createTag(named: name)
+    }
+
+    func assign(_ favoriteID: String, toFolder folderID: UUID?) throws {
+        guard try metadataStore.assign(favoriteID, toFolder: folderID) else { return }
+        applyFilter()
+        onChange?()
+    }
+
+    func assign(_ favoriteIDs: [String], toFolder folderID: UUID?) throws {
+        guard try metadataStore.assign(Set(favoriteIDs), toFolder: folderID) else { return }
+        applyFilter()
+        onChange?()
+    }
+
+    func toggleTag(_ tagID: UUID, for favoriteID: String) throws {
+        guard try metadataStore.toggleTag(tagID, for: favoriteID) else { return }
+        rebuildTagSearchSnapshot()
+        applyFilter()
+        onChange?()
+    }
+
+    func setTag(_ tagID: UUID, for favoriteIDs: [String], assigned: Bool) throws {
+        guard try metadataStore.setTag(tagID, for: Set(favoriteIDs), assigned: assigned) else {
+            return
+        }
+        rebuildTagSearchSnapshot()
+        applyFilter()
+        onChange?()
+    }
+
+    func selectFolderFilter(_ folderID: UUID?) throws {
+        guard try metadataStore.selectFolder(folderID) else { return }
+        applyFilter()
+        onChange?()
+    }
+
+    func toggleTagFilter(_ tagID: UUID) throws {
+        guard try metadataStore.toggleSelectedTag(tagID) else { return }
+        applyFilter()
+        onChange?()
+    }
+
+    func clearTagFilters() throws {
+        guard try metadataStore.clearSelectedTags() else { return }
+        applyFilter()
+        onChange?()
+    }
+
+    func deleteFolder(_ folderID: UUID) throws {
+        guard try metadataStore.deleteFolder(folderID) else { return }
+        applyFilter()
+        onChange?()
+    }
+
+    func deleteTag(_ tagID: UUID) throws {
+        guard try metadataStore.deleteTag(tagID) else { return }
+        rebuildTagSearchSnapshot()
+        applyFilter()
+        onChange?()
     }
 
     @discardableResult
@@ -44,6 +135,7 @@ final class GIFLibrary {
         }
         favorites = decoded
         rebuildAvailableFavorites()
+        rebuildTagSearchSnapshot()
         applyFilter()
         onChange?()
         return true
@@ -61,6 +153,8 @@ final class GIFLibrary {
         availableFavoritesByID = [:]
         rankedIDs = nil
         searchResults = [:]
+        try metadataStore.clear()
+        tagSearchSnapshot = .empty
         onChange?()
     }
 
@@ -116,22 +210,35 @@ final class GIFLibrary {
 
     private func applyFilter() {
         guard !query.isEmpty else {
-            filteredFavorites = availableFavorites
+            filteredFavorites =
+                metadataStore.hasActiveFilter
+                ? availableFavorites.filter {
+                    metadataStore.matchesActiveFilters($0.id)
+                }
+                : availableFavorites
             return
         }
         if let rankedIDs {
-            filteredFavorites = rankedIDs.compactMap { availableFavoritesByID[$0] }
+            filteredFavorites =
+                metadataStore.hasActiveFilter
+                ? rankedIDs.compactMap { id in
+                    guard metadataStore.matchesActiveFilters(id) else { return nil }
+                    return availableFavoritesByID[id]
+                }
+                : rankedIDs.compactMap { availableFavoritesByID[$0] }
             return
         }
         let needle = query.folding(
             options: [.caseInsensitive, .diacriticInsensitive],
             locale: .current
         )
+        let hasMetadataFilter = metadataStore.hasActiveFilter
         filteredFavorites = availableFavorites.filter {
-            $0.sourceURL.absoluteString.folding(
-                options: [.caseInsensitive, .diacriticInsensitive],
-                locale: .current
-            ).contains(needle)
+            (!hasMetadataFilter || metadataStore.matchesActiveFilters($0.id))
+                && $0.sourceURL.absoluteString.folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: .current
+                ).contains(needle)
         }
     }
 
@@ -141,7 +248,8 @@ final class GIFLibrary {
         else { return }
         favorites = decoded
         rebuildAvailableFavorites()
-        filteredFavorites = availableFavorites
+        rebuildTagSearchSnapshot()
+        applyFilter()
     }
 
     private func rebuildAvailableFavorites() {
@@ -149,5 +257,9 @@ final class GIFLibrary {
         availableFavoritesByID = Dictionary(
             uniqueKeysWithValues: availableFavorites.map { ($0.id, $0) }
         )
+    }
+
+    private func rebuildTagSearchSnapshot() {
+        tagSearchSnapshot = metadataStore.makeTagSearchSnapshot(favorites: favorites)
     }
 }

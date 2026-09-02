@@ -21,6 +21,11 @@ actor SearchCoordinator {
         case failure(String)
     }
 
+    private struct ResultCacheKey: Hashable, Sendable {
+        let query: String
+        let tagVersion: UUID
+    }
+
     private enum PendingEmbedding {
         case cached([Float])
         case task(Task<EmbeddingOutcome, Never>)
@@ -37,8 +42,9 @@ actor SearchCoordinator {
     private var vectorSearchSnapshot: SQLiteSearchIndex.VectorSearchSnapshot?
     private var cachedFavorites: [GIFFavorite] = []
     private var urlSearchSnapshot = URLSearchSnapshot(favorites: [])
-    private var resultCache: [String: [GIFSearchResult]] = [:]
-    private var resultCacheOrder: [String] = []
+    private var tagSearchSnapshot = GIFTagSearchSnapshot.empty
+    private var resultCache: [ResultCacheKey: [GIFSearchResult]] = [:]
+    private var resultCacheOrder: [ResultCacheKey] = []
     private var queryVectorCache: [String: [Float]] = [:]
     private var queryVectorCacheOrder: [String] = []
     private var pendingQueryVectorWrites: [String: [Float]] = [:]
@@ -71,8 +77,11 @@ actor SearchCoordinator {
     /// Starts the two expensive cold resources as soon as the popover opens,
     /// before a person can focus the field and type a searchable second
     /// character. Both are released again when the popover closes.
-    func prepareForPresentation(_ favorites: [GIFFavorite]) async {
-        prepareSearchCorpus(favorites)
+    func prepareForPresentation(
+        _ favorites: [GIFFavorite],
+        tagSnapshot: GIFTagSearchSnapshot
+    ) async {
+        prepareSearchCorpus(favorites, tagSnapshot: tagSnapshot)
         if vectorSearchSnapshot == nil, !isIndexing {
             vectorSearchSnapshot = index?.makeVectorSearchSnapshot()
         }
@@ -265,11 +274,16 @@ actor SearchCoordinator {
         return true
     }
 
-    func search(_ query: String, among favorites: [GIFFavorite]) async -> [GIFSearchResult] {
+    func search(
+        _ query: String,
+        among favorites: [GIFFavorite],
+        tagSnapshot: GIFTagSearchSnapshot
+    ) async -> [GIFSearchResult] {
         guard SearchQueryPolicy.isSearchable(query), !Task.isCancelled else { return [] }
-        prepareSearchCorpus(favorites)
-        if let cached = resultCache[query] {
-            touchCachedResult(query)
+        prepareSearchCorpus(favorites, tagSnapshot: tagSnapshot)
+        let cacheKey = ResultCacheKey(query: query, tagVersion: tagSnapshot.version)
+        if let cached = resultCache[cacheKey] {
+            touchCachedResult(cacheKey)
             return cached
         }
         if SearchQueryPolicy.requiresStrictConjunction(query) {
@@ -277,19 +291,21 @@ actor SearchCoordinator {
                 SearchQueryPolicy.commaSeparatedClauses(query),
                 among: favorites
             )
-            if !Task.isCancelled { cacheResults(results, for: query) }
+            if !Task.isCancelled { cacheResults(results, for: cacheKey) }
             return results
         }
         let pendingQueryVector = beginEmbeddingVector(for: query)
         defer { pendingQueryVector.cancel() }
         let fts = index?.search(query) ?? []
         let direct = urlSearchSnapshot.matchingIDs(query)
+        let tagged =
+            tagSearchSnapshot.isEmpty ? [] : tagSearchSnapshot.matchingIDs(query)
         let looksNatural =
-            fts.isEmpty && direct.isEmpty
+            fts.isEmpty && direct.isEmpty && tagged.isEmpty
             ? await SemanticQueryGate.looksNatural(query)
             : false
         guard !Task.isCancelled else { return [] }
-        let hasLexicalEvidence = !fts.isEmpty || !direct.isEmpty || looksNatural
+        let hasLexicalEvidence = !fts.isEmpty || !direct.isEmpty || !tagged.isEmpty || looksNatural
         let queryVector = await finishEmbeddingVector(pendingQueryVector, for: query)
         guard !Task.isCancelled else { return [] }
         let scoredSemantic =
@@ -303,12 +319,16 @@ actor SearchCoordinator {
         let semanticScores = Dictionary(
             uniqueKeysWithValues: scoredSemantic.map { ($0.id, $0.score) })
         let directSet = Set(direct)
+        let tagSet = Set(tagged)
         let ocrSet = Set(fts)
         let semanticSet = Set(semantic)
 
         var scores: [String: Double] = [:]
         for (rank, id) in direct.enumerated() {
             scores[id, default: 0] += 4.0 / Double(1 + rank)
+        }
+        for (rank, id) in tagged.enumerated() {
+            scores[id, default: 0] += 4.25 / Double(1 + rank)
         }
         for (rank, id) in fts.enumerated() {
             scores[id, default: 0] += 1.35 / Double(60 + rank)
@@ -331,11 +351,12 @@ actor SearchCoordinator {
             return GIFSearchResult(
                 id: id,
                 matchedURL: directSet.contains(id),
+                matchedTag: tagSet.contains(id),
                 matchedOCR: ocrSet.contains(id),
                 aiSimilarityPercentage: aiSimilarityPercentage
             )
         }
-        cacheResults(results, for: query)
+        cacheResults(results, for: cacheKey)
         return results
     }
 
@@ -349,6 +370,7 @@ actor SearchCoordinator {
         var clauseMatches: [Set<String>] = []
         var clauseOCR: [Set<String>] = []
         var clauseURL: [Set<String>] = []
+        var clauseTag: [Set<String>] = []
         var clauseSemantic: [Set<String>] = []
         var clauseSemanticScores: [[String: Float]] = []
 
@@ -358,8 +380,12 @@ actor SearchCoordinator {
             defer { pendingVector.cancel() }
             let ocr = Set(index?.search(clause) ?? []).intersection(favoriteIDs)
             let url = Set(urlSearchSnapshot.matchingIDs(clause))
+            let tag =
+                tagSearchSnapshot.isEmpty
+                ? []
+                : Set(tagSearchSnapshot.matchingIDs(clause)).intersection(favoriteIDs)
             let looksNatural =
-                ocr.isEmpty && url.isEmpty
+                ocr.isEmpty && url.isEmpty && tag.isEmpty
                 ? await SemanticQueryGate.looksNatural(clause)
                 : false
             guard !Task.isCancelled else { return [] }
@@ -371,15 +397,16 @@ actor SearchCoordinator {
                 } ?? []
             let semanticIDs = SemanticResultFilter.ids(
                 from: scored,
-                hasLexicalEvidence: !ocr.isEmpty || !url.isEmpty || looksNatural
+                hasLexicalEvidence: !ocr.isEmpty || !url.isEmpty || !tag.isEmpty || looksNatural
             )
             let semantic = Set(semanticIDs).intersection(favoriteIDs)
-            let matches = ocr.union(url).union(semantic)
+            let matches = ocr.union(url).union(tag).union(semantic)
             guard !matches.isEmpty else { return [] }
 
             clauseMatches.append(matches)
             clauseOCR.append(ocr)
             clauseURL.append(url)
+            clauseTag.append(tag)
             clauseSemantic.append(semantic)
             clauseSemanticScores.append(
                 Dictionary(
@@ -404,11 +431,16 @@ actor SearchCoordinator {
             var semanticPercentages: [Int] = []
             var matchedOCR = false
             var matchedURL = false
+            var matchedTag = false
 
             for index in clauses.indices {
                 var strength = 0.0
                 if clauseURL[index].contains(id) {
                     matchedURL = true
+                    strength = 1.0
+                }
+                if clauseTag[index].contains(id) {
+                    matchedTag = true
                     strength = 1.0
                 }
                 if clauseOCR[index].contains(id) {
@@ -435,6 +467,7 @@ actor SearchCoordinator {
                 result: GIFSearchResult(
                     id: id,
                     matchedURL: matchedURL,
+                    matchedTag: matchedTag,
                     matchedOCR: matchedOCR,
                     aiSimilarityPercentage: aiSimilarityPercentage
                 ),
@@ -474,6 +507,7 @@ actor SearchCoordinator {
         indexingIDs.removeAll(keepingCapacity: false)
         cachedFavorites.removeAll(keepingCapacity: false)
         urlSearchSnapshot = URLSearchSnapshot(favorites: [])
+        tagSearchSnapshot = .empty
         clearResultCache()
         queryVectorCache.removeAll(keepingCapacity: false)
         queryVectorCacheOrder.removeAll(keepingCapacity: false)
@@ -484,11 +518,21 @@ actor SearchCoordinator {
         latestProgress = nil
     }
 
-    private func prepareSearchCorpus(_ favorites: [GIFFavorite]) {
-        guard favorites != cachedFavorites else { return }
-        cachedFavorites = favorites
-        urlSearchSnapshot = URLSearchSnapshot(favorites: favorites)
-        clearResultCache()
+    private func prepareSearchCorpus(
+        _ favorites: [GIFFavorite],
+        tagSnapshot: GIFTagSearchSnapshot
+    ) {
+        let favoritesChanged = favorites != cachedFavorites
+        if favoritesChanged {
+            cachedFavorites = favorites
+            urlSearchSnapshot = URLSearchSnapshot(favorites: favorites)
+            tagSearchSnapshot = tagSnapshot
+            clearResultCache()
+        }
+        if !favoritesChanged && tagSnapshot.version != tagSearchSnapshot.version {
+            tagSearchSnapshot = tagSnapshot
+            clearResultCache()
+        }
     }
 
     private func semanticMatches(for vector: [Float]) -> [SQLiteSearchIndex.VectorMatch] {
@@ -569,19 +613,19 @@ actor SearchCoordinator {
         }
     }
 
-    private func cacheResults(_ results: [GIFSearchResult], for query: String) {
+    private func cacheResults(_ results: [GIFSearchResult], for key: ResultCacheKey) {
         guard !Task.isCancelled else { return }
-        resultCache[query] = results
-        touchCachedResult(query)
+        resultCache[key] = results
+        touchCachedResult(key)
         if resultCacheOrder.count > 64 {
             let evicted = resultCacheOrder.removeFirst()
             resultCache.removeValue(forKey: evicted)
         }
     }
 
-    private func touchCachedResult(_ query: String) {
-        resultCacheOrder.removeAll { $0 == query }
-        resultCacheOrder.append(query)
+    private func touchCachedResult(_ key: ResultCacheKey) {
+        resultCacheOrder.removeAll { $0 == key }
+        resultCacheOrder.append(key)
     }
 
     private func touchCachedVector(_ query: String) {
